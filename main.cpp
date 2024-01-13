@@ -103,19 +103,6 @@ class Timer {
 // A big 'ol lookup table.
 int num_lookup[1<<20];
 
-// inline int gen_num_key(char*& it) {
-//     auto num_key=0;
-//     bool end_flag=false;
-//     for (int i=0; i < 6; ++i) {
-//       auto c = *it;
-//       end_flag = end_flag | (c == '\n');
-//       num_key = (num_key * end_flag) + (((num_key << 4) | (c - 44)) * !end_flag);
-//       it += !end_flag;
-//       // std::cout << "c: " << c << " k:" << num_key << " ef: " << end_flag << std::endl;
-//     }
-//     return num_key;
-// }
-
 // int ones_table[58] = {
 //   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 //   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -144,6 +131,42 @@ inline int gen_num_key(char*& it) {
     // -9.9n
     // 99.9n
     // 9.9n
+
+    // // Load 16 bytes from an aligned location
+    // __m128i aligned_data = _mm_load_si128((__m128i*)(it - 1));  // Load an extra byte to ensure alignment
+    //
+    // // Extract the lower 16 - shift bytes (shift is the number of bytes to shift)
+    // int shift = (uintptr_t)(it - 1) & 0xF;
+    //
+    // if (shift == 0) {
+    //     // No shift required
+    // } else if (shift == 1) {
+    //     aligned_data = _mm_srli_si128(aligned_data, 1);
+    // } else if (shift == 2) {
+    //     aligned_data = _mm_srli_si128(aligned_data, 2);
+    // } // Add more conditions as needed for other shift values
+    //
+    // // Subtract 45 from the loaded data
+    // __m128i sub_45 = _mm_set1_epi8(45);
+    // aligned_data = _mm_sub_epi8(aligned_data, sub_45);
+    //
+    // // Extract the individual characters after subtraction
+    // int it_0 = _mm_extract_epi8(aligned_data, 0);
+    // int it_1 = _mm_extract_epi8(aligned_data, 1);
+    // int it_2 = _mm_extract_epi8(aligned_data, 2);
+    // int it_3 = _mm_extract_epi8(aligned_data, 3);
+    // int it_4 = _mm_extract_epi8(aligned_data, 4);
+    //
+    // // Check for newline characters
+    // int nl_3 = _mm_extract_epi8(aligned_data, 3) == '\n';
+    // int nl_4 = _mm_extract_epi8(aligned_data, 4) == '\n';
+    // int nl_5 = _mm_extract_epi8(aligned_data, 5) == '\n';
+    //
+    // int value = 0;
+    // int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_4 | nl_5) | (it_4 * nl_5);
+    // it += (5 * nl_4) + (4 * nl_3) + (6 * nl_5);
+    // return k;
+
     int it_0 = *it;
     int it_1 = *(it + 1);
     int it_2 = *(it + 2);
@@ -225,16 +248,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // auto x = "-99.9\n";
-    // auto y = "99.9\n";
-    // auto x1 = (char*)&x[0];
-    // auto y1 = (char*)&y[0];
-    // auto k1 = gen_num_key(x1);
-    // auto k2 = gen_num_key(y1);
-    // std::cout << k1 << std::endl;
-    // std::cout << k2 << std::endl;
-    // exit(0);
-
     // Loop for integers from -99 to 99
     for (int num = -99; num <= 99; ++num) {
         // Loop for decimal places from 0 to 9
@@ -243,12 +256,12 @@ int main(int argc, char** argv) {
             auto it = s.data();
             auto k = gen_num_key(it);
             num_lookup[k] = num * 10 + (num < 0 ? -decimal : decimal);
-            std::cout  << k << " " << num_lookup[k] << std::endl;
+            // std::cout  << k << " " << num_lookup[k] << std::endl;
         }
     }
 
     // Determine the number of CPUs
-    unsigned num_cpus = 8;//std::thread::hardware_concurrency();
+    unsigned num_cpus = 1;//std::thread::hardware_concurrency();
 
     // Create an array for starting positions
     std::vector<char*> starting_positions(num_cpus, map);
@@ -273,8 +286,6 @@ int main(int argc, char** argv) {
 
     std::atomic<int> counter(0);
 
-    // using MapIndex = std::string_view;
-    // using TheMap = std::unordered_map<MapIndex, MinMaxAvg, FastHash>;
     using MapIndex = uint64_t;
     using TheMap = std::unordered_map<MapIndex, MinMaxAvg>;
 
@@ -282,20 +293,119 @@ int main(int argc, char** argv) {
     auto process_chunk = [map, &counter](char* start, char* end, TheMap &result) {
         char* it = start;
         int inner_counter = 0;
-        while (it < end) {
-            char* s=it;
-            // Gen key while finding the ';' character.
-            uint32_t key = 0;
-            // uint32_t key = 0xFFFFFFFF;
-            while (*it != ';') {
-              // key = (key * 31) ^ (unsigned char)*it;
-              key = _mm_crc32_u8(key, *it);
-              ++it;
-            }
-            // key = ~key;
-            std::string_view key_str(s, it - s);
 
-            ++it;
+        alignas(16) std::aligned_storage_t<128, 16> _name_buffer;
+        alignas(16) std::aligned_storage_t<16, 16> _value_buffer;
+        auto name_buffer = (char*)&_name_buffer;
+        auto value_buffer = (char*)&_value_buffer;
+        const __m128i semicolon = _mm_set1_epi8(';');
+        const __m128i newline = _mm_set1_epi8('\n');
+        const __m128i zero = _mm_setzero_si128();
+
+        // Each time around the loop, it points to the start of the next line.
+        while (it < end) {
+          char* aligned_start = (char*)((uintptr_t)it & ~(uintptr_t)0x0F);
+          char* aligned_it = aligned_start;
+          int offset = it - aligned_it;
+
+          // Pos relative to it.
+          bool first = true;
+          // int semicolon_pos = -offset;
+          // int newline_pos = 0;
+          
+          // Loop reading into data, until semicolon_index is set (relative to data).
+          __m128i data;
+          int semicolon_index = -1;
+          while (true) {
+outer:
+            data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(aligned_it));
+
+            __m128i result_semicolon = _mm_cmpeq_epi8(data, semicolon);
+
+            int semicolon_mask = _mm_movemask_epi8(result_semicolon);
+
+            if (!semicolon_mask) {
+              // Gosh, it's a long name, or we're very mis-aligned. Keep on reading.
+              aligned_it += 16;
+              first = false;
+              continue;
+            }
+
+            semicolon_index = __builtin_ctz(semicolon_mask);
+            
+            while (first && semicolon_index < offset) {
+              // Case where our aligned read, read the previous line.
+              // Our aligned read could return e.g.
+              //
+              // ch;27.2\nGabès;24.0
+              //          ^-- Start of line.
+              //
+              // In this case, semicolon_index = 2, offset = 7.
+              // Zero the bit and go again, after which semicolon_index = 13.
+              semicolon_mask &= ~(1 << semicolon_index);
+              // std::cout << "here " << offset << " " << semicolon_mask << std::endl;
+              if (!semicolon_mask) {
+                aligned_it += 16;
+                first = false;
+                goto outer;
+              }
+              semicolon_index = __builtin_ctz(semicolon_mask);
+            }
+
+            break;
+          }
+
+            // __m128i result_newline = _mm_cmpeq_epi8(data, newline);
+            // int newline_mask = _mm_movemask_epi8(result_newline);
+            // int newline_index = newline_mask ? __builtin_ctz(newline_mask) : -1;
+
+            // We've found the semicolon delimeter, populate our name_buffer for hashing.
+            // Erase up to 15 zeros after the name, so we can hash without collecting garbage.
+            auto name_len = (aligned_it + semicolon_index) - aligned_start - offset;
+            std::memcpy(name_buffer, it, name_len);
+            std::memset(name_buffer + name_len, 0, 16);
+            auto key = _mm_crc32_u64(0ULL, *reinterpret_cast<uint64_t*>(name_buffer));
+            key = _mm_crc32_u64(key, *reinterpret_cast<uint64_t*>(name_buffer+8));
+
+            std::string_view key_str(it, name_len);
+            it += name_len + 1;
+            // std::memcpy(value_buffer, it, 6);
+            auto num_key = gen_num_key(it);
+            auto value = num_lookup[num_key];
+            // if (semicolon_index > 9) {
+            //   // If our last buffer read has more than 9 name chars in it, then we may not have the full value.
+            //   // _____name;-99.99\n
+            // }
+
+            // std::cout << "offset: " << offset << " len: " << name_len  << " n: " << name_buffer << " k: " << key << " v:" << value << std::endl;
+
+            // while (*it != '\n') ++it;
+            // ++it;
+
+            // Update the result map
+            result[key].update(key_str, value);
+
+            ++inner_counter;
+            // if (inner_counter > 1000) break;
+            // continue;
+
+            // std::memcpy(name_buffer, str + i, copyLength);
+
+
+        // while (it < end) {
+            // char* s=it;
+            // // Gen key while finding the ';' character.
+            // uint32_t key = 0;
+            // // uint32_t key = 0xFFFFFFFF;
+            // while (*it != ';') {
+            //   // key = (key * 31) ^ (unsigned char)*it;
+            //   key = _mm_crc32_u8(key, *it);
+            //   ++it;
+            // }
+            // // key = ~key;
+            // std::string_view key_str(s, it - s);
+            //
+            // ++it;
 
             // Potential value formats where n is newline and * is anything.
             // -99.9n
@@ -325,8 +435,8 @@ int main(int argc, char** argv) {
             //   }
             // }
 
-            auto num_key = gen_num_key(it);
-            auto value = num_lookup[num_key];
+            // auto num_key = gen_num_key(it);
+            // auto value = num_lookup[num_key];
             // std::cout << key_str << " " << num_key << " " << value << std::endl;
             // ++it;
 
@@ -347,9 +457,9 @@ int main(int argc, char** argv) {
             // ++it;
 
             // Update the result map
-            result[key].update(key_str, value);
+            // result[key].update(key_str, value);
 
-            ++inner_counter;
+            // ++inner_counter;
         }
         counter += inner_counter;
     };
