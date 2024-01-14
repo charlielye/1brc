@@ -15,7 +15,6 @@
 #include <string>
 #include <fcntl.h>
 #include <limits>
-#include <bitset>
 
 #include <cstdio>
 #include <ctime>
@@ -24,6 +23,28 @@
 #include <sys/time.h>
 #include <nmmintrin.h>
 #include <immintrin.h>
+
+#ifdef __AVX512F__
+using VecType = __m512i;
+using MaskType = __mmask64;
+const int VecSize = 64;
+#define VEC_SET1_EPI8 _mm512_set1_epi8
+#define VEC_LOADU_SI _mm512_loadu_si512
+#define VEC_CMPEQ_EPI8_MASK _mm512_cmpeq_epi8_mask
+#define VEC_MOVEMASK_EPI8 _mm512_movemask_epi8
+#define VEC_STORE_SI(buffer, data) _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data)
+#define TZCNT _tzcnt_u64
+#else
+using VecType = __m256i;
+using MaskType = __mmask32;
+const int VecSize = 32;
+#define VEC_SET1_EPI8 _mm256_set1_epi8
+#define VEC_LOADU_SI _mm256_loadu_si256
+#define VEC_CMPEQ_EPI8_MASK(data, val) _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, val))
+#define VEC_STORE_SI(buffer, data) _mm256_store_si256(reinterpret_cast<__m256i*>(buffer), data)
+#define TZCNT _tzcnt_u32
+#endif
+
 
 /**
  * @brief Get the execution between a block of code.
@@ -107,7 +128,7 @@ class Timer {
 // A big 'ol lookup table.
 int num_lookup[1<<20];
 
-inline int gen_num_key_simple(const char* data, int newline_index) {
+inline int gen_num_key(const char* data, int newline_index) {
     // Potential value formats where n is newline.
     // -99.9n
     // -9.9n
@@ -126,25 +147,25 @@ inline int gen_num_key_simple(const char* data, int newline_index) {
     return k;
 }
 
-inline int gen_num_key_simd(__m128i& data, int newline_index) {
-    // Subtract 45 from the loaded data
-    __m128i sub_45 = _mm_set1_epi8(45);
-    auto sub_data = _mm_sub_epi8(data, sub_45);
-
-    // Extract the individual characters after subtraction
-    int it_0 = _mm_extract_epi8(sub_data, 0);
-    int it_1 = _mm_extract_epi8(sub_data, 1);
-    int it_2 = _mm_extract_epi8(sub_data, 2);
-    int it_3 = _mm_extract_epi8(sub_data, 3);
-    int it_4 = _mm_extract_epi8(sub_data, 4);
-
-    // Check for newline characters
-    int nl_g3 = newline_index > 3;
-    int nl_5 = newline_index == 5;
-
-    int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_g3) | (it_4 * nl_5);
-    return k;
-}
+// inline int gen_num_key_simd(__m128i& data, int newline_index) {
+//     // Subtract 45 from the loaded data
+//     __m128i sub_45 = _mm_set1_epi8(45);
+//     auto sub_data = _mm_sub_epi8(data, sub_45);
+//
+//     // Extract the individual characters after subtraction
+//     int it_0 = _mm_extract_epi8(sub_data, 0);
+//     int it_1 = _mm_extract_epi8(sub_data, 1);
+//     int it_2 = _mm_extract_epi8(sub_data, 2);
+//     int it_3 = _mm_extract_epi8(sub_data, 3);
+//     int it_4 = _mm_extract_epi8(sub_data, 4);
+//
+//     // Check for newline characters
+//     int nl_g3 = newline_index > 3;
+//     int nl_5 = newline_index == 5;
+//
+//     int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_g3) | (it_4 * nl_5);
+//     return k;
+// }
 
 struct MinMaxAvg {
     std::string_view name;
@@ -157,6 +178,7 @@ struct MinMaxAvg {
 
     void update(std::string_view const& key_str, int value) {
         name = key_str;
+        // BRANCHLESS IS WORSE.
         // bool lt = value < min;
         // bool gt = value > max;
         // min = min * !lt + value * lt;
@@ -208,20 +230,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Loop for integers from -99 to 99
-    for (int num = -99; num <= 99; ++num) {
-        // Loop for decimal places from 0 to 9
-        for (int decimal = 0; decimal <= 9; ++decimal) {
-            auto s = std::to_string(num) + "." + std::to_string(decimal) + '\n';
-            auto it = s.data();
-            auto k = gen_num_key_simple(it, s.find('\n'));
-            num_lookup[k] = num * 10 + (num < 0 ? -decimal : decimal);
-            // std::cout  << k << " " << num_lookup[k] << std::endl;
-        }
-    }
-
     // Determine the number of CPUs
-    unsigned num_cpus = 32;//std::thread::hardware_concurrency();
+    unsigned num_cpus = 64;//std::thread::hardware_concurrency();
 
     // Create an array for starting positions
     std::vector<char*> starting_positions(num_cpus, map);
@@ -242,6 +252,17 @@ int main(int argc, char** argv) {
         //     std::cerr << "Failed madvise." << std::endl;
         //     exit(-1);
         // }
+    }
+
+    // Compute number lookup table.
+    for (int num = -99; num <= 99; ++num) {
+        for (int decimal = 0; decimal <= 9; ++decimal) {
+            auto s = std::to_string(num) + "." + std::to_string(decimal) + '\n';
+            auto it = s.data();
+            auto k = gen_num_key(it, s.find('\n'));
+            num_lookup[k] = num * 10 + (num < 0 ? -decimal : decimal);
+            // std::cout  << k << " " << num_lookup[k] << std::endl;
+        }
     }
 
     // Index by str len, hence we'll index from 1.
@@ -269,8 +290,20 @@ int main(int argc, char** argv) {
 
     std::atomic<int> counter(0);
 
+    // ***********************************************************************
     // TODO: WARNING! WARNING! WARNING! THIS DOESN'T YET HANDLE COLLISIONS!
     // Magic number chosen to avoid collisions on test data set.
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    // DID YOU FORGET ABOUT THIS!? DONT!
+    // ***********************************************************************
     constexpr size_t HashMapSize = 1024 * 128;
     MinMaxAvg hash_map[HashMapSize];
 
@@ -282,28 +315,29 @@ int main(int argc, char** argv) {
         char* it = start;
         int inner_counter = 0;
 
-        const __m512i semicolon = _mm512_set1_epi8(';');
-        const __m512i newline = _mm512_set1_epi8('\n');
+        const VecType semicolon = VEC_SET1_EPI8(';');
         char* line_start = it;
 
         while (it < end) {
+            // Prefetch data to be accessed in the future
+            // _mm_prefetch(it + VecSize, _MM_HINT_T0); // _MM_HINT_T0: Prefetch into all cache levels
+
             // Load 64 bytes unaligned into 512 bit register.
-            __m512i data = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(it));
+            VecType data = VEC_LOADU_SI(reinterpret_cast<const VecType*>(it));
 
             // DEBUG PRINT DATA
-            // alignas(64) char buffer[64];
-            // _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data);
+            // alignas(VecSize) char buffer[VecSize];
+            // VEC_STORE_SI(reinterpret_cast<__m512i*>(buffer), data);
             // std::string str(buffer, 64);
             // std::replace(str.begin(), str.end(), '\n', ' ');
             // std::cout << str << std::endl;
 
-            __mmask64 sc_mask = _mm512_cmpeq_epi8_mask(data, semicolon);
+            MaskType sc_mask = VEC_CMPEQ_EPI8_MASK(data, semicolon);
             
-
             while (sc_mask) {
               // std::bitset<64> bits(sc_mask);
               // std::cout << bits << std::endl;
-              int sc_index = _tzcnt_u64(sc_mask);
+              int sc_index = TZCNT(sc_mask);
               char* sc_pos = it + sc_index;
               if (__builtin_expect(sc_pos >= end, 0)) break;
 
@@ -330,7 +364,7 @@ int main(int argc, char** argv) {
               int nl_index = 4;
               if (v_pos[3] == '\n') nl_index = 3;
               if (v_pos[5] == '\n') nl_index = 5;
-              auto num_key = gen_num_key_simple(v_pos, nl_index);
+              auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
               result[key % HashMapSize].update(key_str, value);
@@ -342,7 +376,7 @@ int main(int argc, char** argv) {
               // if (inner_counter > 100) exit(0);
             }
 
-            it += 64;
+            it += VecSize;
             // std::cout << inner_counter << std::endl;
             // exit(0);
 
@@ -358,7 +392,22 @@ int main(int argc, char** argv) {
         char* start = starting_positions[i];
         char* end = (i == num_cpus - 1) ? map + sb.st_size : starting_positions[i + 1];
         // thread_results[i].reserve(1024 << 3);
-        threads.push_back(std::thread(process_chunk, start, end, std::ref(thread_results[i])));
+        // threads.push_back(std::thread(process_chunk, start, end, std::ref(thread_results[i])));
+        //
+        threads.emplace_back([=, &thread_results] {
+          // Set thread affinity to CPU core 'i'
+          cpu_set_t cpuset;
+          CPU_ZERO(&cpuset);
+          CPU_SET(i, &cpuset);
+
+          int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+          if (rc != 0) {
+              std::cerr << "Error setting thread affinity: " << rc << std::endl;
+          }
+
+          // Call the processing function
+          process_chunk(start, end, std::ref(thread_results[i]));
+      });
     }
 
     // Join threads
