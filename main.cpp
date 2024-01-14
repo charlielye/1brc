@@ -104,69 +104,12 @@ class Timer {
 // A big 'ol lookup table.
 int num_lookup[1<<20];
 
-// int ones_table[58] = {
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-//   2, 3, 4, 5, 6, 7, 8, 9 };
-// int tens_table[58] = {
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 10,
-//   20, 30, 40, 50, 60, 70, 80, 90 };
-// int hundreds_table[58] = {
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-//   0, 0, 0, 0, 0, 0, 0, 0, 0, 100,
-//   200, 300, 400, 500, 600, 700, 800, 900 };
-
 inline int gen_num_key(char* it) {
     // Potential value formats where n is newline.
     // -99.9n
     // -9.9n
     // 99.9n
     // 9.9n
-
-    // // Load 16 bytes from an aligned location
-    // __m128i aligned_data = _mm_load_si128((__m128i*)(it - 1));  // Load an extra byte to ensure alignment
-    //
-    // // Extract the lower 16 - shift bytes (shift is the number of bytes to shift)
-    // int shift = (uintptr_t)(it - 1) & 0xF;
-    //
-    // if (shift == 0) {
-    //     // No shift required
-    // } else if (shift == 1) {
-    //     aligned_data = _mm_srli_si128(aligned_data, 1);
-    // } else if (shift == 2) {
-    //     aligned_data = _mm_srli_si128(aligned_data, 2);
-    // } // Add more conditions as needed for other shift values
-    //
-    // // Subtract 45 from the loaded data
-    // __m128i sub_45 = _mm_set1_epi8(45);
-    // aligned_data = _mm_sub_epi8(aligned_data, sub_45);
-    //
-    // // Extract the individual characters after subtraction
-    // int it_0 = _mm_extract_epi8(aligned_data, 0);
-    // int it_1 = _mm_extract_epi8(aligned_data, 1);
-    // int it_2 = _mm_extract_epi8(aligned_data, 2);
-    // int it_3 = _mm_extract_epi8(aligned_data, 3);
-    // int it_4 = _mm_extract_epi8(aligned_data, 4);
-    //
-    // // Check for newline characters
-    // int nl_3 = _mm_extract_epi8(aligned_data, 3) == '\n';
-    // int nl_4 = _mm_extract_epi8(aligned_data, 4) == '\n';
-    // int nl_5 = _mm_extract_epi8(aligned_data, 5) == '\n';
-    //
-    // int value = 0;
-    // int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_4 | nl_5) | (it_4 * nl_5);
-    // it += (5 * nl_4) + (4 * nl_3) + (6 * nl_5);
-    // return k;
 
     int it_0 = *it;
     int it_1 = *(it + 1);
@@ -181,9 +124,42 @@ inline int gen_num_key(char* it) {
     it_2 -= 45;
     it_3 -= 45;
     it_4 -= 45;
-    int value = 0;
     int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_4 | nl_5) | (it_4 * nl_5);
-    // it += (5 * nl_4) + (4 * nl_3) + (6 * nl_5);
+    return k;
+}
+
+inline int gen_num_key_simple(const char* data, int newline_index) {
+    // Subtract 45 and shift
+    int it_0 = (data[0] - 45) << 16;
+    int it_1 = (data[1] - 45) << 12;
+    int it_2 = (data[2] - 45) << 8;
+    int it_3 = (data[3] - 45) << 4;
+    int it_4 = data[4] - 45;
+
+    int nl_g3 = newline_index > 3;
+    int nl_5 = newline_index == 5;
+
+    int k = it_0 | it_1 | it_2 | (it_3 * nl_g3) | (it_4 * nl_5);
+    return k;
+}
+
+inline int gen_num_key_simd(__m128i& data, int newline_index) {
+    // Subtract 45 from the loaded data
+    __m128i sub_45 = _mm_set1_epi8(45);
+    auto sub_data = _mm_sub_epi8(data, sub_45);
+
+    // Extract the individual characters after subtraction
+    int it_0 = _mm_extract_epi8(sub_data, 0);
+    int it_1 = _mm_extract_epi8(sub_data, 1);
+    int it_2 = _mm_extract_epi8(sub_data, 2);
+    int it_3 = _mm_extract_epi8(sub_data, 3);
+    int it_4 = _mm_extract_epi8(sub_data, 4);
+
+    // Check for newline characters
+    int nl_g3 = newline_index > 3;
+    int nl_5 = newline_index == 5;
+
+    int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_g3) | (it_4 * nl_5);
     return k;
 }
 
@@ -262,7 +238,7 @@ int main(int argc, char** argv) {
     }
 
     // Determine the number of CPUs
-    unsigned num_cpus = 1;//std::thread::hardware_concurrency();
+    unsigned num_cpus = 8;//std::thread::hardware_concurrency();
 
     // Create an array for starting positions
     std::vector<char*> starting_positions(num_cpus, map);
@@ -305,24 +281,27 @@ int main(int argc, char** argv) {
         // char* aligned_start = (char*)((uintptr_t)it & ~(uintptr_t)0x0F);
         // char* aligned_it = aligned_start;
         // int offset = it - aligned_it;
-        char* last_semi = 0;
+        // char* last_semi = 0;
         char* line_start = it;
 
         // std::memset(name_buffer, 0, 128);
 
         while (it < end) {
+            // Load 16 bytes unaligned into 128 bit register.
             __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(it));
 
+            // Determine if there are any semicolons.
             __m128i result_semicolon = _mm_cmpeq_epi8(data, semicolon);
             int semicolon_mask = _mm_movemask_epi8(result_semicolon);
 
-            if (semicolon_mask) {
-              int semicolon_index = __builtin_ctz(semicolon_mask);
-              last_semi = it + semicolon_index;
-            } else {
+            if (!semicolon_mask) {
               it += 16;
               continue;
             }
+
+            // We found one, determine its actual location.
+            int semicolon_index = __builtin_ctz(semicolon_mask);
+            char* last_semi = it + semicolon_index;
 
             // Compute lookup key.
             std::string_view key_str(line_start, last_semi - line_start);
@@ -336,9 +315,10 @@ int main(int argc, char** argv) {
             int newline_mask = _mm_movemask_epi8(result_newline);
             int newline_index = __builtin_ctz(newline_mask);
 
-            auto num_key = gen_num_key(last_semi+1);
+            auto num_key = gen_num_key_simple(last_semi+1, newline_index);
+            // auto num_key = gen_num_key(last_semi+1);
             auto value = num_lookup[num_key];
-            line_start = last_semi + 1 + __builtin_ctz(newline_mask) + 1;
+            line_start = last_semi + 1 + newline_index + 1;
             // std::cout << "len: " << key_str.size()  << " n: " << key_str << " k: " << key << " v:" << value << std::endl;
             result[key].update(key_str, value);
             ++inner_counter;
