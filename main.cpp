@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <crc32intrin.h>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -14,6 +15,7 @@
 #include <string>
 #include <fcntl.h>
 #include <limits>
+#include <bitset>
 
 #include <cstdio>
 #include <ctime>
@@ -21,6 +23,7 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <nmmintrin.h>
+#include <immintrin.h>
 
 /**
  * @brief Get the execution between a block of code.
@@ -104,32 +107,12 @@ class Timer {
 // A big 'ol lookup table.
 int num_lookup[1<<20];
 
-inline int gen_num_key(char* it) {
+inline int gen_num_key_simple(const char* data, int newline_index) {
     // Potential value formats where n is newline.
     // -99.9n
     // -9.9n
     // 99.9n
     // 9.9n
-
-    int it_0 = *it;
-    int it_1 = *(it + 1);
-    int it_2 = *(it + 2);
-    int it_3 = *(it + 3);
-    int it_4 = *(it + 4);
-    int nl_5 = *(it + 5) == '\n';
-    int nl_4 = it_4 == '\n';
-    int nl_3 = it_3 == '\n';
-    it_0 -= 45;
-    it_1 -= 45;
-    it_2 -= 45;
-    it_3 -= 45;
-    it_4 -= 45;
-    int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_4 | nl_5) | (it_4 * nl_5);
-    return k;
-}
-
-inline int gen_num_key_simple(const char* data, int newline_index) {
-    // Subtract 45 and shift
     int it_0 = (data[0] - 45) << 16;
     int it_1 = (data[1] - 45) << 12;
     int it_2 = (data[2] - 45) << 8;
@@ -231,7 +214,7 @@ int main(int argc, char** argv) {
         for (int decimal = 0; decimal <= 9; ++decimal) {
             auto s = std::to_string(num) + "." + std::to_string(decimal) + '\n';
             auto it = s.data();
-            auto k = gen_num_key(it);
+            auto k = gen_num_key_simple(it, s.find('\n'));
             num_lookup[k] = num * 10 + (num < 0 ? -decimal : decimal);
             // std::cout  << k << " " << num_lookup[k] << std::endl;
         }
@@ -261,150 +244,162 @@ int main(int argc, char** argv) {
         // }
     }
 
+    // Index by str len, hence we'll index from 1.
+    uint64_t hash_masks[101];
+    uint64_t hash_masks2[101];
+    for (int i=1; i<=100; ++i) {
+      hash_masks[i] = ~0x0;
+      hash_masks2[i] = ~0x0;
+    }
+    for (int i=1; i<8; ++i) {
+      // Discard tail bytes of first word.
+      hash_masks[i] = (1ULL << (i * 8)) - 1;
+      // Discard all of second word.
+      hash_masks2[i] = 0;
+    }
+    for (int i=8; i<16; ++i) {
+      // Discard tail bytes of second word.
+      hash_masks2[i] = (1ULL << ((i-8) * 8)) - 1;
+    }
+    // DEBUG HASH MASKS.
+    // for (int i=1; i<101; ++i) {
+    //   std::cout << std::setw(16) << std::setfill('0') << std::hex << hash_masks2[i] << 
+    //     std::setw(16) << std::setfill('0') << std::hex << hash_masks[i] << std::endl;
+    // }
+
     std::atomic<int> counter(0);
 
+    constexpr size_t HashMapSize = 1024 * 128;
+    MinMaxAvg hash_map[HashMapSize];
+
     using MapIndex = uint64_t;
-    using TheMap = std::unordered_map<MapIndex, MinMaxAvg>;
+    using TheMap = decltype(hash_map);// std::unordered_map<MapIndex, MinMaxAvg>;
 
     // Function for each thread
-    auto process_chunk = [map, &counter](char* start, char* end, TheMap &result) {
+    auto process_chunk = [&](char* start, char* end, TheMap &result) {
         char* it = start;
         int inner_counter = 0;
 
-        // alignas(16) std::aligned_storage_t<128, 16> _name_buffer;
-        // alignas(16) std::aligned_storage_t<16, 16> _value_buffer;
-        // auto name_buffer = (char*)&_name_buffer;
-        // auto value_buffer = (char*)&_value_buffer;
-        const __m128i semicolon = _mm_set1_epi8(';');
-        const __m128i newline = _mm_set1_epi8('\n');
-        const __m128i zero = _mm_setzero_si128();
-        // char* aligned_start = (char*)((uintptr_t)it & ~(uintptr_t)0x0F);
-        // char* aligned_it = aligned_start;
-        // int offset = it - aligned_it;
-        // char* last_semi = 0;
+        const __m512i semicolon = _mm512_set1_epi8(';');
+        const __m512i newline = _mm512_set1_epi8('\n');
         char* line_start = it;
 
-        // std::memset(name_buffer, 0, 128);
-
         while (it < end) {
-            // Load 16 bytes unaligned into 128 bit register.
-            __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(it));
+            // Load 64 bytes unaligned into 512 bit register.
+            __m512i data = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(it));
 
-            // Determine if there are any semicolons.
-            __m128i result_semicolon = _mm_cmpeq_epi8(data, semicolon);
-            int semicolon_mask = _mm_movemask_epi8(result_semicolon);
+            // DEBUG PRINT DATA
+            // alignas(64) char buffer[64];
+            // _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data); // Store the data from the SIMD register into the buffer
+            // std::string str(buffer, 64); // Create a string from the buffer
+            // std::replace(str.begin(), str.end(), '\n', ' ');
+            // std::cout << str << std::endl;
 
-            if (!semicolon_mask) {
-              it += 16;
-              continue;
+            __mmask64 sc_mask = _mm512_cmpeq_epi8_mask(data, semicolon);
+            
+
+            while (sc_mask) {
+              // std::bitset<64> bits(sc_mask);
+              // std::cout << bits << std::endl;
+              int sc_index = _tzcnt_u64(sc_mask);
+              char* sc_pos = it + sc_index;
+              if (__builtin_expect(sc_pos >= end, 0)) break;
+
+              // Compute hash key for name.
+              std::string_view key_str(line_start, sc_pos - line_start);
+              // std::cout << key_str << std::endl;
+
+              // WHY SO SLOW?
+              // uint64_t key = 0;
+              auto key1 = ((uint64_t*)line_start)[0];
+              key1 &= hash_masks[key_str.size()];
+              auto key2 = ((uint64_t*)line_start)[1];
+              key2 &= hash_masks2[key_str.size()];
+              // auto key = key1 ^ key2;
+              uint64_t key = _mm_crc32_u64(0, key1);
+              key = _mm_crc32_u64(key, key2);
+
+              // std::cout << std::hex << key1 << " " << key2 << " " << key << " " << hash_masks[key_str.size()] << std::endl;
+              // exit(0);
+
+              // WORKS BIT SLOW: 1900
+              // uint32_t key = 0;
+              // switch (key_str.size()) {
+              //   case 3:
+              //     key = _mm_crc32_u16(key, *(uint16_t*)line_start);
+              //     key = _mm_crc32_u8(key, line_start[2]);
+              //     break;
+              //   case 4:
+              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
+              //     break;
+              //   case 5:
+              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
+              //     key = _mm_crc32_u8(key, line_start[4]);
+              //     break;
+              //   case 6:
+              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
+              //     key = _mm_crc32_u16(key, *(uint16_t*)(line_start+4));
+              //     break;
+              //   case 7:
+              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
+              //     key = _mm_crc32_u16(key, *(uint16_t*)(line_start+4));
+              //     key = _mm_crc32_u8(key, line_start[6]);
+              //     break;
+              //   case 8:
+              //     key = _mm_crc32_u64(key, *(uint64_t*)line_start);
+              //     break;
+              //   default:
+              //     key = _mm_crc32_u64(key, *(uint64_t*)line_start);
+              //     key = _mm_crc32_u8(key, line_start[8]);
+              //     break;
+              // }
+
+              // ABOUT THE SAME: 1800
+              // uint64_t key = 0;
+              // for (int i=0; i<9 && i < key_str.size(); ++i) {
+              //   key = (key * 31) ^ line_start[i];
+              // }
+
+              // ABOUT THE SAME: 1800
+              // uint64_t key = 0;
+              // for (int i=0; i<9 && i < key_str.size(); ++i) {
+              //   key = (key * 31) ^ line_start[i];
+              // }
+
+              // ABOUT THE SAME
+              // uint64_t key = 0;
+              // for (int i=0; i<9 && i < key_str.size(); ++i) {
+              //     key = _mm_crc32_u8(key, line_start[i]);
+              // }
+
+              // 2700
+              // uint64_t data_aligned[2] = { 0 };
+              // std::memcpy(data_aligned, line_start, std::min(key_str.size(), (size_t)9));
+              // uint64_t key = _mm_crc32_u64(0, data_aligned[0]);
+              // key = _mm_crc32_u64(key, data_aligned[1]);
+
+              // Extract value.
+              char* v_pos = sc_pos + 1;
+              int nl_index = 4;
+              if (v_pos[3] == '\n') nl_index = 3;
+              if (v_pos[5] == '\n') nl_index = 5;
+              auto num_key = gen_num_key_simple(v_pos, nl_index);
+              auto value = num_lookup[num_key];
+
+              result[key % HashMapSize].update(key_str, value);
+
+              sc_mask &= ~(1ULL << sc_index);
+              line_start = v_pos + nl_index + 1;
+              ++inner_counter;
+              // std::cout << "len: " << key_str.size()  << " n: " << key_str << " k: " << key << " v: " << value << std::endl;
+              // if (inner_counter > 100) exit(0);
             }
 
-            // We found one, determine its actual location.
-            int semicolon_index = __builtin_ctz(semicolon_mask);
-            char* last_semi = it + semicolon_index;
+            it += 64;
+            // std::cout << inner_counter << std::endl;
+            // exit(0);
 
-            // Compute lookup key.
-            std::string_view key_str(line_start, last_semi - line_start);
-            uint64_t key = 0;
-            for (auto c : key_str) {
-              key = _mm_crc32_u8(key, c);
-            }
-
-            data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(last_semi+1));
-            __m128i result_newline = _mm_cmpeq_epi8(data, newline);
-            int newline_mask = _mm_movemask_epi8(result_newline);
-            int newline_index = __builtin_ctz(newline_mask);
-
-            auto num_key = gen_num_key_simple(last_semi+1, newline_index);
-            // auto num_key = gen_num_key(last_semi+1);
-            auto value = num_lookup[num_key];
-            line_start = last_semi + 1 + newline_index + 1;
-            // std::cout << "len: " << key_str.size()  << " n: " << key_str << " k: " << key << " v:" << value << std::endl;
-            result[key].update(key_str, value);
-            ++inner_counter;
-            // if (inner_counter > 10) exit(0);
-
-            it = line_start;
         }
-          
-            // Update the result map
-            // result[key].update(key_str, value);
-
-            // ++inner_counter;
-            // if (inner_counter > 1000) break;
-            // continue;
-
-            // std::memcpy(name_buffer, str + i, copyLength);
-
-
-        // while (it < end) {
-            // char* s=it;
-            // // Gen key while finding the ';' character.
-            // uint32_t key = 0;
-            // // uint32_t key = 0xFFFFFFFF;
-            // while (*it != ';') {
-            //   // key = (key * 31) ^ (unsigned char)*it;
-            //   key = _mm_crc32_u8(key, *it);
-            //   ++it;
-            // }
-            // // key = ~key;
-            // std::string_view key_str(s, it - s);
-            //
-            // ++it;
-
-            // Potential value formats where n is newline and * is anything.
-            // -99.9n
-            // -9.9n
-            // 99.9n
-            // 9.9n*
-            // int it_3 = *(it + 3);
-            // int it_4 = *(it + 4);
-            // int value = 0;
-            // if (__builtin_expect(it_4 == '\n', 1)) {
-            //   int it_0 = *it;
-            //   int it_1 = *(it + 1);
-            //   bool is_negative = (it_0 == '-');
-            //   value = tens_table[it_1] + ones_table[it_3];
-            //   value = -value * is_negative + (hundreds_table[it_0] + value) * !is_negative;
-            //   it += 5;
-            // } else {
-            //   int it_0 = *it;
-            //   int it_2 = *(it + 2);
-            //   if (it_3 == '\n') {
-            //     value = tens_table[it_0] + ones_table[it_2];
-            //     it += 4;
-            //   } else {
-            //     int it_1 = *(it + 1);
-            //     value = -(hundreds_table[it_1] + tens_table[it_2] + ones_table[it_4]);
-            //     it += 6;
-            //   }
-            // }
-
-            // auto num_key = gen_num_key(it);
-            // auto value = num_lookup[num_key];
-            // std::cout << key_str << " " << num_key << " " << value << std::endl;
-            // ++it;
-
-
-            // Check for negative numbers
-            // int* s_lookup = sign_table[*it];
-            // it += sign_adv_table[*it];
-
-            // while (*it != '\n') {
-            //   // Skip the decimal.
-            //   if (*it == '.') {
-            //     ++it;
-            //     continue;
-            //   }
-            //   value = value * 10 + (*it - '0');
-              // ++it;
-            // }
-            // ++it;
-
-            // Update the result map
-            // result[key].update(key_str, value);
-
-            // ++inner_counter;
         counter += inner_counter;
     };
 
@@ -415,7 +410,7 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; i < num_cpus; ++i) {
         char* start = starting_positions[i];
         char* end = (i == num_cpus - 1) ? map + sb.st_size : starting_positions[i + 1];
-        thread_results[i].reserve(1024 << 3);
+        // thread_results[i].reserve(1024 << 3);
         threads.push_back(std::thread(process_chunk, start, end, std::ref(thread_results[i])));
     }
 
@@ -431,11 +426,18 @@ int main(int argc, char** argv) {
     combinedResults.reserve(1024);
     for (auto &thread_result : thread_results) {
         for (auto &kv : thread_result) {
-          auto& cr = combinedResults[kv.second.name];
-          if (kv.second.min < cr.min) cr.min = kv.second.min;
-          if (kv.second.max > cr.max) cr.max = kv.second.max;
-          cr.sum += kv.second.sum;
-          cr.count += kv.second.count;
+          if (kv.name.empty()) continue;
+          auto& cr = combinedResults[kv.name];
+          if (kv.min < cr.min) cr.min = kv.min;
+          if (kv.max > cr.max) cr.max = kv.max;
+          cr.sum += kv.sum;
+          cr.count += kv.count;
+
+          // auto& cr = combinedResults[kv.second.name];
+          // if (kv.second.min < cr.min) cr.min = kv.second.min;
+          // if (kv.second.max > cr.max) cr.max = kv.second.max;
+          // cr.sum += kv.second.sum;
+          // cr.count += kv.second.count;
         }
     }
     auto t2r = t2.milliseconds();
@@ -470,6 +472,20 @@ int main(int argc, char** argv) {
     std::cout << "    Unmap: " << t4r << std::endl;
     std::cout << "    Total: " << total << std::endl;
     std::cout << "Processed: " << counter << std::endl;
+
+    // for (int j=0; j<thread_results.size(); ++j) {
+    //     size_t totalCollisions = 0;
+    //     for (size_t i = 0; i < thread_results[j].bucket_count(); ++i) {
+    //         size_t bucketSize = thread_results[j].bucket_size(i);
+    //         if (bucketSize > 1) {
+    //             totalCollisions += (bucketSize - 1);
+    //             // std::cout << "Bucket " << i << " has " << bucketSize << " elements (collision!)\n";
+    //         }
+    //     }
+    //
+    //     std::cout << "T" << j << " Total collisions: " << totalCollisions << std::endl;
+    //     std::cout << "T" << j << " Load factor: " << thread_results[j].load_factor() << std::endl;
+    // }
 
     return 0;
 }
