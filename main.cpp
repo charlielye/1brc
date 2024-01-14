@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
     }
 
     // Determine the number of CPUs
-    unsigned num_cpus = 8;//std::thread::hardware_concurrency();
+    unsigned num_cpus = 32;//std::thread::hardware_concurrency();
 
     // Create an array for starting positions
     std::vector<char*> starting_positions(num_cpus, map);
@@ -269,6 +269,8 @@ int main(int argc, char** argv) {
 
     std::atomic<int> counter(0);
 
+    // TODO: WARNING! WARNING! WARNING! THIS DOESN'T YET HANDLE COLLISIONS!
+    // Magic number chosen to avoid collisions on test data set.
     constexpr size_t HashMapSize = 1024 * 128;
     MinMaxAvg hash_map[HashMapSize];
 
@@ -290,8 +292,8 @@ int main(int argc, char** argv) {
 
             // DEBUG PRINT DATA
             // alignas(64) char buffer[64];
-            // _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data); // Store the data from the SIMD register into the buffer
-            // std::string str(buffer, 64); // Create a string from the buffer
+            // _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data);
+            // std::string str(buffer, 64);
             // std::replace(str.begin(), str.end(), '\n', ' ');
             // std::cout << str << std::endl;
 
@@ -309,74 +311,19 @@ int main(int argc, char** argv) {
               std::string_view key_str(line_start, sc_pos - line_start);
               // std::cout << key_str << std::endl;
 
-              // WHY SO SLOW?
-              // uint64_t key = 0;
-              auto key1 = ((uint64_t*)line_start)[0];
-              key1 &= hash_masks[key_str.size()];
-              auto key2 = ((uint64_t*)line_start)[1];
-              key2 &= hash_masks2[key_str.size()];
-              // auto key = key1 ^ key2;
-              uint64_t key = _mm_crc32_u64(0, key1);
-              key = _mm_crc32_u64(key, key2);
-
-              // std::cout << std::hex << key1 << " " << key2 << " " << key << " " << hash_masks[key_str.size()] << std::endl;
-              // exit(0);
-
-              // WORKS BIT SLOW: 1900
-              // uint32_t key = 0;
-              // switch (key_str.size()) {
-              //   case 3:
-              //     key = _mm_crc32_u16(key, *(uint16_t*)line_start);
-              //     key = _mm_crc32_u8(key, line_start[2]);
-              //     break;
-              //   case 4:
-              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
-              //     break;
-              //   case 5:
-              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
-              //     key = _mm_crc32_u8(key, line_start[4]);
-              //     break;
-              //   case 6:
-              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
-              //     key = _mm_crc32_u16(key, *(uint16_t*)(line_start+4));
-              //     break;
-              //   case 7:
-              //     key = _mm_crc32_u32(key, *(uint32_t*)line_start);
-              //     key = _mm_crc32_u16(key, *(uint16_t*)(line_start+4));
-              //     key = _mm_crc32_u8(key, line_start[6]);
-              //     break;
-              //   case 8:
-              //     key = _mm_crc32_u64(key, *(uint64_t*)line_start);
-              //     break;
-              //   default:
-              //     key = _mm_crc32_u64(key, *(uint64_t*)line_start);
-              //     key = _mm_crc32_u8(key, line_start[8]);
-              //     break;
-              // }
-
-              // ABOUT THE SAME: 1800
-              // uint64_t key = 0;
-              // for (int i=0; i<9 && i < key_str.size(); ++i) {
-              //   key = (key * 31) ^ line_start[i];
-              // }
-
-              // ABOUT THE SAME: 1800
-              // uint64_t key = 0;
-              // for (int i=0; i<9 && i < key_str.size(); ++i) {
-              //   key = (key * 31) ^ line_start[i];
-              // }
-
-              // ABOUT THE SAME
-              // uint64_t key = 0;
-              // for (int i=0; i<9 && i < key_str.size(); ++i) {
-              //     key = _mm_crc32_u8(key, line_start[i]);
-              // }
-
-              // 2700
-              // uint64_t data_aligned[2] = { 0 };
-              // std::memcpy(data_aligned, line_start, std::min(key_str.size(), (size_t)9));
-              // uint64_t key = _mm_crc32_u64(0, data_aligned[0]);
-              // key = _mm_crc32_u64(key, data_aligned[1]);
+              uint64_t key = 0;
+              if (__builtin_expect(key_str.size() <= 16, 1)) {
+                auto key1 = ((uint64_t*)line_start)[0];
+                key1 &= hash_masks[key_str.size()];
+                auto key2 = ((uint64_t*)line_start)[1];
+                key2 &= hash_masks2[key_str.size()];
+                key = _mm_crc32_u64(0, key1);
+                key = _mm_crc32_u64(key, key2);
+              } else {
+                for (int i=0; i < key_str.size(); ++i) {
+                  key = _mm_crc32_u8(key, line_start[i]);
+                }
+              }
 
               // Extract value.
               char* v_pos = sc_pos + 1;
