@@ -47,8 +47,7 @@ const int VecSize = 32;
 
 
 /**
- * @brief Get the execution between a block of code.
- *
+ * Get the execution between a block of code.
  */
 class Timer {
   private:
@@ -125,15 +124,16 @@ class Timer {
     }
 };
 
-// A big 'ol lookup table.
+// A big 'ol number lookup table.
 int num_lookup[1<<20];
 
+// Computes the key for looking up in the number lookup table.
+// Potential value formats where n is newline.
+// -99.9n
+// -9.9n
+// 99.9n
+// 9.9n
 inline int gen_num_key(const char* data, int newline_index) {
-    // Potential value formats where n is newline.
-    // -99.9n
-    // -9.9n
-    // 99.9n
-    // 9.9n
     int it_0 = (data[0] - 45) << 16;
     int it_1 = (data[1] - 45) << 12;
     int it_2 = (data[2] - 45) << 8;
@@ -233,12 +233,10 @@ int main(int argc, char** argv) {
     // Determine the number of CPUs
     unsigned num_cpus = 64;//std::thread::hardware_concurrency();
 
-    // Create an array for starting positions
-    std::vector<char*> starting_positions(num_cpus, map);
-
     // long pagesize = sysconf(_SC_PAGESIZE);
 
-    // Calculate starting positions for each thread
+    // Calculate starting positions for each thread.
+    std::vector<char*> starting_positions(num_cpus, map);
     size_t chunk_size = sb.st_size / num_cpus;
     for (unsigned i = 1; i < num_cpus; ++i) {
         size_t pos = i * chunk_size;
@@ -246,7 +244,7 @@ int main(int argc, char** argv) {
         auto start = map+pos;
         starting_positions[i] = start;
 
-        // Advise the kernel of access pattern
+        // Advise the kernel of access pattern (DOESN'T HELP).
         // char* aligned_start = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(start) & ~(pagesize - 1));
         // if (madvise(aligned_start, chunk_size, MADV_SEQUENTIAL) != 0) {
         //     std::cerr << "Failed madvise." << std::endl;
@@ -293,6 +291,7 @@ int main(int argc, char** argv) {
     // ***********************************************************************
     // TODO: WARNING! WARNING! WARNING! THIS DOESN'T YET HANDLE COLLISIONS!
     // Magic number chosen to avoid collisions on test data set.
+    // Use open addressing to handle collisions, avoid memory allocs.
     //
     //
     //
@@ -306,11 +305,10 @@ int main(int argc, char** argv) {
     // ***********************************************************************
     constexpr size_t HashMapSize = 1024 * 128;
     MinMaxAvg hash_map[HashMapSize];
-
     using MapIndex = uint64_t;
-    using TheMap = decltype(hash_map);// std::unordered_map<MapIndex, MinMaxAvg>;
+    using TheMap = decltype(hash_map);
 
-    // Function for each thread
+    // Main processing function for each thread.
     auto process_chunk = [&](char* start, char* end, TheMap &result) {
         char* it = start;
         int inner_counter = 0;
@@ -319,8 +317,8 @@ int main(int argc, char** argv) {
         char* line_start = it;
 
         while (it < end) {
-            // Prefetch data to be accessed in the future
-            // _mm_prefetch(it + VecSize, _MM_HINT_T0); // _MM_HINT_T0: Prefetch into all cache levels
+            // Prefetch data to be accessed in the future (DOESN'T HELP).
+            // _mm_prefetch(it + VecSize, _MM_HINT_T0);
 
             // Load 64 bytes unaligned into 512 bit register.
             VecType data = VEC_LOADU_SI(reinterpret_cast<const VecType*>(it));
@@ -332,19 +330,22 @@ int main(int argc, char** argv) {
             // std::replace(str.begin(), str.end(), '\n', ' ');
             // std::cout << str << std::endl;
 
+            // Compute mask of semicolon locations.
             MaskType sc_mask = VEC_CMPEQ_EPI8_MASK(data, semicolon);
             
+            // Loop once for each found semicolon.
             while (sc_mask) {
-              // std::bitset<64> bits(sc_mask);
-              // std::cout << bits << std::endl;
               int sc_index = TZCNT(sc_mask);
               char* sc_pos = it + sc_index;
+              // Don't process semicolons meant for other threads (over-read).
               if (__builtin_expect(sc_pos >= end, 0)) break;
 
-              // Compute hash key for name.
+              // This is our station name.
               std::string_view key_str(line_start, sc_pos - line_start);
               // std::cout << key_str << std::endl;
 
+              // Compute key for name.
+              // Names longer than 16 bytes are an edge case.
               uint64_t key = 0;
               if (__builtin_expect(key_str.size() <= 16, 1)) {
                 auto key1 = ((uint64_t*)line_start)[0];
@@ -367,8 +368,11 @@ int main(int argc, char** argv) {
               auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
+              // Locate entry in hashmap and update.
+              // TODO: Handle collision.
               result[key % HashMapSize].update(key_str, value);
 
+              // Remove this semicolon from the semicolon mask and loop back around.
               sc_mask &= ~(1ULL << sc_index);
               line_start = v_pos + nl_index + 1;
               ++inner_counter;
@@ -377,9 +381,6 @@ int main(int argc, char** argv) {
             }
 
             it += VecSize;
-            // std::cout << inner_counter << std::endl;
-            // exit(0);
-
         }
         counter += inner_counter;
     };
@@ -391,9 +392,6 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; i < num_cpus; ++i) {
         char* start = starting_positions[i];
         char* end = (i == num_cpus - 1) ? map + sb.st_size : starting_positions[i + 1];
-        // thread_results[i].reserve(1024 << 3);
-        // threads.push_back(std::thread(process_chunk, start, end, std::ref(thread_results[i])));
-        //
         threads.emplace_back([=, &thread_results] {
           // Set thread affinity to CPU core 'i'
           cpu_set_t cpuset;
@@ -417,6 +415,7 @@ int main(int argc, char** argv) {
     auto t1r = t1.milliseconds();
 
     // Combine results.
+    // WARNING: Loops over the entire table, assumes it isn't too huge.
     auto t2 = Timer();
     std::unordered_map<std::string_view, MinMaxAvg> combinedResults;
     combinedResults.reserve(1024);
@@ -462,26 +461,13 @@ int main(int argc, char** argv) {
     auto t4r = t4.milliseconds();
     auto total = t0.milliseconds();
 
+    std::cout << "  Threads: " << num_cpus << std::endl;
     std::cout << " Parallel: " << t1r << std::endl;
     std::cout << "Combining: " << t2r << std::endl;
     std::cout << "  Writing: " << t3r << std::endl;
     std::cout << "    Unmap: " << t4r << std::endl;
     std::cout << "    Total: " << total << std::endl;
     std::cout << "Processed: " << counter << std::endl;
-
-    // for (int j=0; j<thread_results.size(); ++j) {
-    //     size_t totalCollisions = 0;
-    //     for (size_t i = 0; i < thread_results[j].bucket_count(); ++i) {
-    //         size_t bucketSize = thread_results[j].bucket_size(i);
-    //         if (bucketSize > 1) {
-    //             totalCollisions += (bucketSize - 1);
-    //             // std::cout << "Bucket " << i << " has " << bucketSize << " elements (collision!)\n";
-    //         }
-    //     }
-    //
-    //     std::cout << "T" << j << " Total collisions: " << totalCollisions << std::endl;
-    //     std::cout << "T" << j << " Load factor: " << thread_results[j].load_factor() << std::endl;
-    // }
 
     return 0;
 }
