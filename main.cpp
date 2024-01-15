@@ -169,15 +169,17 @@ inline int gen_num_key(const char* data, int newline_index) {
 
 struct MinMaxAvg {
     std::string_view name;
-    int min;
-    int max;
+    uint32_t key;
+    int16_t min;
+    int16_t max;
     int sum;
     unsigned int count;
 
-    MinMaxAvg() : min(std::numeric_limits<int>::max()), max(std::numeric_limits<int>::min()), sum(0), count(0) {}
+    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), key(0) {}
 
-    void update(std::string_view const& key_str, int value) {
+    void update(std::string_view const& key_str, int _key, int value) {
         name = key_str;
+        key = _key;
         // BRANCHLESS IS WORSE.
         // bool lt = value < min;
         // bool gt = value > max;
@@ -231,7 +233,7 @@ int main(int argc, char** argv) {
     }
 
     // Determine the number of CPUs
-    unsigned num_cpus = 64;//std::thread::hardware_concurrency();
+    unsigned num_cpus = 96;//std::thread::hardware_concurrency();
 
     // long pagesize = sysconf(_SC_PAGESIZE);
 
@@ -288,25 +290,14 @@ int main(int argc, char** argv) {
 
     std::atomic<int> counter(0);
 
-    // ***********************************************************************
-    // TODO: WARNING! WARNING! WARNING! THIS DOESN'T YET HANDLE COLLISIONS!
-    // Magic number chosen to avoid collisions on test data set.
-    // Use open addressing to handle collisions, avoid memory allocs.
-    //
-    //
-    //
-    //
-    //
-    //
-    //
-    //
-    //
-    // DID YOU FORGET ABOUT THIS!? DONT!
-    // ***********************************************************************
-    constexpr size_t HashMapSize = 1024 * 128;
+    // 16384 entries times 32 bytes and entry is 524288 bytes.
+    constexpr size_t HashMapSize = 1024 * 16;
     MinMaxAvg hash_map[HashMapSize];
     using MapIndex = uint64_t;
     using TheMap = decltype(hash_map);
+
+    // std::cout << sizeof(MinMaxAvg) << std::endl;
+    // exit(0);
 
     // Main processing function for each thread.
     auto process_chunk = [&](char* start, char* end, TheMap &result) {
@@ -365,12 +356,21 @@ int main(int argc, char** argv) {
               int nl_index = 4;
               if (v_pos[3] == '\n') nl_index = 3;
               if (v_pos[5] == '\n') nl_index = 5;
+              // bool nl3 = v_pos[3] == '\n';
+              // bool nl4 = v_pos[4] == '\n';
+              // bool nl5 = v_pos[5] == '\n';
+              // int nl_index = (3 * nl3) + (4 * nl4) + (5 * nl5);
               auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
               // Locate entry in hashmap and update.
-              // TODO: Handle collision.
-              result[key % HashMapSize].update(key_str, value);
+              auto lookup_key = key % HashMapSize;
+              auto* entry = &result[lookup_key];
+              while (entry->key && entry->key != key) {
+                lookup_key = (lookup_key + 1) % HashMapSize;
+                entry = &result[lookup_key];
+              }
+              entry->update(key_str, key, value);
 
               // Remove this semicolon from the semicolon mask and loop back around.
               sc_mask &= ~(1ULL << sc_index);
@@ -421,7 +421,7 @@ int main(int argc, char** argv) {
     combinedResults.reserve(1024);
     for (auto &thread_result : thread_results) {
         for (auto &kv : thread_result) {
-          if (kv.name.empty()) continue;
+          if (!kv.key) continue;
           auto& cr = combinedResults[kv.name];
           if (kv.min < cr.min) cr.min = kv.min;
           if (kv.max > cr.max) cr.max = kv.max;
