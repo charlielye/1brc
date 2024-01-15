@@ -204,6 +204,42 @@ struct MinMaxAvg {
     }
 };
 
+// 16384 entries times 32 bytes and entry is 524288 bytes.
+constexpr size_t HashMapSize = 1024 * 16;
+using MapIndex = uint64_t;
+using TheMap = MinMaxAvg[HashMapSize];
+inline MinMaxAvg* lookup(TheMap& map, MapIndex key) {
+    auto lookup_key = key % HashMapSize;
+    auto* entry = &map[lookup_key];
+    while (entry->key && entry->key != key) {
+      lookup_key = (lookup_key + 1) % HashMapSize;
+      entry = &map[lookup_key];
+    }
+    return entry;
+}
+
+// Index by str len, hence we'll index from 1.
+uint64_t hash_masks[101];
+uint64_t hash_masks2[101];
+
+inline uint32_t hash_name(std::string_view const& name) {
+    uint32_t key=0;
+    auto len = name.size();
+    if (__builtin_expect(len <= 16, 1)) {
+      auto data = ((uint64_t*)name.data());
+      auto key1 = data[0] & hash_masks[len];
+      auto key2 = data[1] & hash_masks2[len];
+      key = _mm_crc32_u64(0, key1);
+      key = _mm_crc32_u64(key, key2);
+    } else {
+      // Names longer than 16 bytes are an edge case.
+      for (auto c : name) {
+        key = _mm_crc32_u8(key, c);
+      }
+    }
+    return key;
+}
+
 int main(int argc, char** argv) {
     auto t0 = Timer();
     std::vector<std::string> args(argv, argv + argc);
@@ -233,7 +269,8 @@ int main(int argc, char** argv) {
     }
 
     // Determine the number of CPUs
-    unsigned num_cpus = 96;//std::thread::hardware_concurrency();
+    char* threads_str = std::getenv("THREADS");
+    unsigned num_cpus = threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
 
     // long pagesize = sysconf(_SC_PAGESIZE);
 
@@ -266,8 +303,6 @@ int main(int argc, char** argv) {
     }
 
     // Index by str len, hence we'll index from 1.
-    uint64_t hash_masks[101];
-    uint64_t hash_masks2[101];
     for (int i=1; i<=100; ++i) {
       hash_masks[i] = ~0x0;
       hash_masks2[i] = ~0x0;
@@ -334,43 +369,19 @@ int main(int argc, char** argv) {
               // This is our station name.
               std::string_view key_str(line_start, sc_pos - line_start);
               // std::cout << key_str << std::endl;
-
               // Compute key for name.
-              // Names longer than 16 bytes are an edge case.
-              uint64_t key = 0;
-              if (__builtin_expect(key_str.size() <= 16, 1)) {
-                auto key1 = ((uint64_t*)line_start)[0];
-                key1 &= hash_masks[key_str.size()];
-                auto key2 = ((uint64_t*)line_start)[1];
-                key2 &= hash_masks2[key_str.size()];
-                key = _mm_crc32_u64(0, key1);
-                key = _mm_crc32_u64(key, key2);
-              } else {
-                for (int i=0; i < key_str.size(); ++i) {
-                  key = _mm_crc32_u8(key, line_start[i]);
-                }
-              }
+              uint64_t key = hash_name(key_str);
 
               // Extract value.
               char* v_pos = sc_pos + 1;
               int nl_index = 4;
               if (v_pos[3] == '\n') nl_index = 3;
               if (v_pos[5] == '\n') nl_index = 5;
-              // bool nl3 = v_pos[3] == '\n';
-              // bool nl4 = v_pos[4] == '\n';
-              // bool nl5 = v_pos[5] == '\n';
-              // int nl_index = (3 * nl3) + (4 * nl4) + (5 * nl5);
               auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
               // Locate entry in hashmap and update.
-              auto lookup_key = key % HashMapSize;
-              auto* entry = &result[lookup_key];
-              while (entry->key && entry->key != key) {
-                lookup_key = (lookup_key + 1) % HashMapSize;
-                entry = &result[lookup_key];
-              }
-              entry->update(key_str, key, value);
+              lookup(result, key)->update(key_str, key, value);
 
               // Remove this semicolon from the semicolon mask and loop back around.
               sc_mask &= ~(1ULL << sc_index);
@@ -417,22 +428,16 @@ int main(int argc, char** argv) {
     // Combine results.
     // WARNING: Loops over the entire table, assumes it isn't too huge.
     auto t2 = Timer();
-    std::unordered_map<std::string_view, MinMaxAvg> combinedResults;
-    combinedResults.reserve(1024);
+    std::unordered_map<std::string_view, MinMaxAvg> combined;
+    combined.reserve(HashMapSize);
     for (auto &thread_result : thread_results) {
         for (auto &kv : thread_result) {
           if (!kv.key) continue;
-          auto& cr = combinedResults[kv.name];
+          auto& cr = combined[kv.name];
           if (kv.min < cr.min) cr.min = kv.min;
           if (kv.max > cr.max) cr.max = kv.max;
           cr.sum += kv.sum;
           cr.count += kv.count;
-
-          // auto& cr = combinedResults[kv.second.name];
-          // if (kv.second.min < cr.min) cr.min = kv.second.min;
-          // if (kv.second.max > cr.max) cr.max = kv.second.max;
-          // cr.sum += kv.second.sum;
-          // cr.count += kv.second.count;
         }
     }
     auto t2r = t2.milliseconds();
@@ -440,17 +445,19 @@ int main(int argc, char** argv) {
     // Write to file.
     auto t3 = Timer();
     std::vector<std::string_view> keys;
-    for (const auto &kv : combinedResults) {
+    for (const auto &kv : combined) {
         keys.push_back(kv.first);
     }
     std::sort(keys.begin(), keys.end());
 
     std::ofstream outFile("output.txt");
-    outFile << std::fixed << std::setprecision(1);
-    for (const auto &key : keys) {
-        const auto &mav = combinedResults[key];
-        outFile << key << "=" << mav.Min() << "/" << mav.avg() << "/" << mav.Max() << std::endl;
+    outFile << std::fixed << std::setprecision(1) << "{";
+    for (auto it = keys.begin(); it != keys.end(); ++it) {
+      const auto &mav = combined[*it];
+      outFile << *it << "=" << mav.Min() << "/" << mav.avg() << "/" << mav.Max();
+      if (__builtin_expect(std::next(it) != keys.end(), 0)) outFile << ", ";
     }
+    outFile << "}\n";
     outFile.close();
     auto t3r = t3.milliseconds();
 
