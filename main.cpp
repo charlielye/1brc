@@ -45,83 +45,27 @@ const int VecSize = 32;
 #define TZCNT _tzcnt_u32
 #endif
 
-
-/**
- * Get the execution between a block of code.
- */
+// It's a timer.
 class Timer {
-  private:
-    struct timespec _startTime;
-    struct timespec _endTime;
+public:
+    Timer() : start_(std::chrono::high_resolution_clock::now()) {}
 
-    static constexpr int64_t NanosecondsPerSecond = 1000LL * 1000 * 1000;
-
-    /**
-     * @brief Manually sets the start time.
-     */
-    void start() { clock_gettime(CLOCK_REALTIME, &_startTime); }
-
-    /**
-     * @brief Manually sets the end time.
-     */
-    void end() { clock_gettime(CLOCK_REALTIME, &_endTime); }
-
-  public:
-    /**
-     * @brief Initialize a Timer with the current time.
-     *
-     */
-    Timer()
-        : _endTime({})
-    {
-        start();
+    void reset() {
+        start_ = std::chrono::high_resolution_clock::now();
     }
 
-    /**
-     * @brief Return the number of nanoseconds elapsed since the start of the timer.
-     */
-    [[nodiscard]] int64_t nanoseconds() const
-    {
-        struct timespec end;
-        if (_endTime.tv_nsec == 0 && _endTime.tv_sec == 0) {
-            clock_gettime(CLOCK_REALTIME, &end);
-        } else {
-            end = _endTime;
-        }
-
-        int64_t nanos = (end.tv_sec - _startTime.tv_sec) * NanosecondsPerSecond;
-        nanos += (end.tv_nsec - _startTime.tv_nsec);
-
-        return nanos;
+    int64_t nanoseconds() const {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now() - start_).count();
     }
 
-    /**
-     * @brief Return the number of nanoseconds elapsed since the start of the timer.
-     */
-    [[nodiscard]] double milliseconds() const
-    {
+    double milliseconds() const {
         int64_t nanos = nanoseconds();
         return static_cast<double>(nanos) / 1000000;
     }
 
-    /**
-     * @brief Return the number of seconds elapsed since the start of the timer.
-     */
-    [[nodiscard]] double seconds() const
-    {
-        int64_t nanos = nanoseconds();
-        double secs = static_cast<double>(nanos) / NanosecondsPerSecond;
-        return secs;
-    }
-
-    /**
-     * @brief Return the number of seconds elapsed since the start of the timer as a string.
-     */
-    [[nodiscard]] std::string toString() const
-    {
-        double secs = seconds();
-        return std::to_string(secs);
-    }
+private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_;
 };
 
 // A big 'ol number lookup table.
