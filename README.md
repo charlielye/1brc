@@ -1,5 +1,25 @@
 # 1️⃣🐝🏎️ The One Billion Row Challenge
 
+Perfoms fractionally better than https://github.com/lehuyduc/1brc-simd.
+I didn't look at any other solutions while developing, as a result there's tricks missed, and maybe more performance to be gained.
+lehuyduc's code seems to leverge some ILP tricks that I haven't got. Maybe others around reordering etc.
+Probably the largest performance gain comes from leverage avx512 simd instructions, which lehuyduc's solution could be easily adapted to take advantage of.
+
+Comparison benchmark results against last and current generation aws intel and amd machines: https://docs.google.com/spreadsheets/d/1GkPeLJ-a4vFGoZU53JodoyP1pqLE0cLtRjEdMjZR_dc/edit?usp=sharing
+
+
+
+
+
+
+
+
+
+
+
+
+# Original README
+
 _Status Jan 10: I am in the process of moving to another execution environment for this challenge. Once that is done, the leaderboard will be refreshed with the results from that new environment, and I'll continue to evaluate pending submissions._
 
 _Status Jan 1: This challenge is [open for submissions](https://www.morling.dev/blog/one-billion-row-challenge/)!_
