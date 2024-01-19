@@ -45,6 +45,9 @@ const int VecSize = 32;
 #define TZCNT _tzcnt_u32
 #endif
 
+#define yay(x) __builtin_expect(x, 1)
+#define nay(x) __builtin_expect(x, 0)
+
 // It's a timer.
 class Timer {
 public:
@@ -77,7 +80,16 @@ int num_lookup[1<<20];
 // -9.9n
 // 99.9n
 // 9.9n
-inline int gen_num_key(const char* data, int newline_index) {
+inline __attribute__((always_inline)) int gen_num_key(const char* data, int newline_index) {
+    // __m128i reg = _mm_loadu_si128((__m128i*)data);
+    // __m128i sub_45 = _mm_set1_epi8(45);
+    // auto sub_data = _mm_sub_epi8(reg, sub_45);
+    //
+    // int it_0 = _mm_extract_epi8(sub_data, 0) << 16;
+    // int it_1 = _mm_extract_epi8(sub_data, 1) << 12;
+    // int it_2 = _mm_extract_epi8(sub_data, 2) << 8;
+    // int it_3 = _mm_extract_epi8(sub_data, 3) << 4;
+    // int it_4 = _mm_extract_epi8(sub_data, 4);
     int it_0 = (data[0] - 45) << 16;
     int it_1 = (data[1] - 45) << 12;
     int it_2 = (data[2] - 45) << 8;
@@ -91,26 +103,6 @@ inline int gen_num_key(const char* data, int newline_index) {
     return k;
 }
 
-// inline int gen_num_key_simd(__m128i& data, int newline_index) {
-//     // Subtract 45 from the loaded data
-//     __m128i sub_45 = _mm_set1_epi8(45);
-//     auto sub_data = _mm_sub_epi8(data, sub_45);
-//
-//     // Extract the individual characters after subtraction
-//     int it_0 = _mm_extract_epi8(sub_data, 0);
-//     int it_1 = _mm_extract_epi8(sub_data, 1);
-//     int it_2 = _mm_extract_epi8(sub_data, 2);
-//     int it_3 = _mm_extract_epi8(sub_data, 3);
-//     int it_4 = _mm_extract_epi8(sub_data, 4);
-//
-//     // Check for newline characters
-//     int nl_g3 = newline_index > 3;
-//     int nl_5 = newline_index == 5;
-//
-//     int k = it_0 << 16 | it_1 << 12 | it_2 << 8 | (it_3 << 4) * (nl_g3) | (it_4 * nl_5);
-//     return k;
-// }
-
 struct MinMaxAvg {
     std::string_view name;
     uint32_t key;
@@ -121,16 +113,11 @@ struct MinMaxAvg {
 
     MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), key(0) {}
 
-    void update(std::string_view const& key_str, int _key, int value) {
+    inline void update(std::string_view const& key_str, int _key, int16_t value) {
         name = key_str;
         key = _key;
-        // BRANCHLESS IS WORSE.
-        // bool lt = value < min;
-        // bool gt = value > max;
-        // min = min * !lt + value * lt;
-        // max = max * !gt + value * gt;
-        if (value < min) min = value;
-        if (value > max) max = value;
+        min = std::min(min, value);
+        max = std::max(min, value);
         sum += value;
         ++count;
     }
@@ -166,10 +153,10 @@ inline MinMaxAvg* lookup(TheMap& map, MapIndex key) {
 uint64_t hash_masks[101];
 uint64_t hash_masks2[101];
 
-inline uint32_t hash_name(std::string_view const& name) {
+inline  __attribute__((always_inline)) uint32_t hash_name(std::string_view const& name) {
     uint32_t key=0;
     auto len = name.size();
-    if (__builtin_expect(len <= 16, 1)) {
+    if (yay(len <= 16)) {
       auto data = ((uint64_t*)name.data());
       auto key1 = data[0] & hash_masks[len];
       auto key2 = data[1] & hash_masks2[len];
@@ -286,7 +273,7 @@ int main(int argc, char** argv) {
         const VecType semicolon = VEC_SET1_EPI8(';');
         char* line_start = it;
 
-        while (it < end) {
+        while (yay(it < end)) {
             // Prefetch data to be accessed in the future (DOESN'T HELP).
             // _mm_prefetch(it + VecSize, _MM_HINT_T0);
 
@@ -304,23 +291,24 @@ int main(int argc, char** argv) {
             MaskType sc_mask = VEC_CMPEQ_EPI8_MASK(data, semicolon);
             
             // Loop once for each found semicolon.
-            while (sc_mask) {
+            while (yay(sc_mask)) {
               int sc_index = TZCNT(sc_mask);
               char* sc_pos = it + sc_index;
               // Don't process semicolons meant for other threads (over-read).
-              if (__builtin_expect(sc_pos >= end, 0)) break;
+              if (nay(sc_pos >= end)) break;
 
               // This is our station name.
               std::string_view key_str(line_start, sc_pos - line_start);
               // std::cout << key_str << std::endl;
-              // Compute key for name.
+              // Compute key for name. Costs about 15ms.
               uint64_t key = hash_name(key_str);
 
               // Extract value.
               char* v_pos = sc_pos + 1;
               int nl_index = 4;
-              if (v_pos[3] == '\n') nl_index = 3;
-              if (v_pos[5] == '\n') nl_index = 5;
+              nl_index += v_pos[5] == '\n';
+              nl_index -= v_pos[3] == '\n';
+              // Costs about 60ms.
               auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
@@ -399,7 +387,7 @@ int main(int argc, char** argv) {
     for (auto it = keys.begin(); it != keys.end(); ++it) {
       const auto &mav = combined[*it];
       outFile << *it << "=" << mav.Min() << "/" << mav.avg() << "/" << mav.Max();
-      if (__builtin_expect(std::next(it) != keys.end(), 0)) outFile << ", ";
+      if (nay(std::next(it) != keys.end())) outFile << ", ";
     }
     outFile << "}\n";
     outFile.close();
