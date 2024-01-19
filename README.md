@@ -7,7 +7,12 @@ Probably the largest performance gain comes from leverage avx512 simd instructio
 
 Comparison benchmark results against last and current generation aws intel and amd machines: https://docs.google.com/spreadsheets/d/1GkPeLJ-a4vFGoZU53JodoyP1pqLE0cLtRjEdMjZR_dc/edit?usp=sharing
 
+## Example usage.
 
+```
+clang++-16 -O3 -std=c++20 -march=native -pthread main.cpp
+THREADS=8 ./a.out
+```
 
 
 
