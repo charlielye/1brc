@@ -72,7 +72,8 @@ private:
 };
 
 // A big 'ol number lookup table.
-int num_lookup[1<<20];
+constexpr int NUM_LOOKUP_TABLE_SIZE = 1<<15;
+int num_lookup[NUM_LOOKUP_TABLE_SIZE];
 
 // Computes the key for looking up in the number lookup table.
 // Potential value formats where n is newline.
@@ -81,26 +82,10 @@ int num_lookup[1<<20];
 // 99.9n
 // 9.9n
 inline __attribute__((always_inline)) int gen_num_key(const char* data, int newline_index) {
-    // __m128i reg = _mm_loadu_si128((__m128i*)data);
-    // __m128i sub_45 = _mm_set1_epi8(45);
-    // auto sub_data = _mm_sub_epi8(reg, sub_45);
-    //
-    // int it_0 = _mm_extract_epi8(sub_data, 0) << 16;
-    // int it_1 = _mm_extract_epi8(sub_data, 1) << 12;
-    // int it_2 = _mm_extract_epi8(sub_data, 2) << 8;
-    // int it_3 = _mm_extract_epi8(sub_data, 3) << 4;
-    // int it_4 = _mm_extract_epi8(sub_data, 4);
-    int it_0 = (data[0] - 45) << 16;
-    int it_1 = (data[1] - 45) << 12;
-    int it_2 = (data[2] - 45) << 8;
-    int it_3 = (data[3] - 45) << 4;
-    int it_4 = data[4] - 45;
-
-    int nl_g3 = newline_index > 3;
-    int nl_5 = newline_index == 5;
-
-    int k = it_0 | it_1 | it_2 | (it_3 * nl_g3) | (it_4 * nl_5);
-    return k;
+    uint32_t i = *(uint32_t*)(data);
+    uint32_t k = _mm_crc32_u32(0, i);
+    if (nay(newline_index == 5)) k = _mm_crc32_u8(k, data[4]);
+    return k % NUM_LOOKUP_TABLE_SIZE;
 }
 
 struct MinMaxAvg {
@@ -117,7 +102,7 @@ struct MinMaxAvg {
         name = key_str;
         key = _key;
         min = std::min(min, value);
-        max = std::max(min, value);
+        max = std::max(max, value);
         sum += value;
         ++count;
     }
@@ -135,14 +120,14 @@ struct MinMaxAvg {
     }
 };
 
-// 16384 entries times 32 bytes and entry is 524288 bytes.
+// 16384 entries times 32 bytes an entry is 524288 bytes.
 constexpr size_t HashMapSize = 1024 * 16;
 using MapIndex = uint64_t;
 using TheMap = MinMaxAvg[HashMapSize];
 inline MinMaxAvg* lookup(TheMap& map, MapIndex key) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
-    while (entry->key && entry->key != key) {
+    while (nay(entry->key && entry->key != key)) {
       lookup_key = (lookup_key + 1) % HashMapSize;
       entry = &map[lookup_key];
     }
@@ -156,16 +141,15 @@ uint64_t hash_masks2[101];
 inline  __attribute__((always_inline)) uint32_t hash_name(std::string_view const& name) {
     uint32_t key=0;
     auto len = name.size();
-    if (yay(len <= 16)) {
-      auto data = ((uint64_t*)name.data());
-      auto key1 = data[0] & hash_masks[len];
-      auto key2 = data[1] & hash_masks2[len];
-      key = _mm_crc32_u64(0, key1);
-      key = _mm_crc32_u64(key, key2);
-    } else {
+    auto data = ((uint64_t*)name.data());
+    auto key1 = data[0] & hash_masks[len];
+    auto key2 = data[1] & hash_masks2[len];
+    key = _mm_crc32_u64(0, key1);
+    key = _mm_crc32_u64(key, key2);
+    if (nay(len > 16)) {
       // Names longer than 16 bytes are an edge case.
-      for (auto c : name) {
-        key = _mm_crc32_u8(key, c);
+      for (int i=16; i<len; ++i) {
+        key = _mm_crc32_u8(key, name[i]);
       }
     }
     return key;
@@ -228,8 +212,13 @@ int main(int argc, char** argv) {
             auto s = std::to_string(num) + "." + std::to_string(decimal) + '\n';
             auto it = s.data();
             auto k = gen_num_key(it, s.find('\n'));
+            if (nay(num_lookup[k] != 0)) {
+              std::cout << "collision! " << k << " " << num_lookup[k] << std::endl;
+              exit(1);
+            }
+
             num_lookup[k] = num * 10 + (num < 0 ? -decimal : decimal);
-            // std::cout  << k << " " << num_lookup[k] << std::endl;
+              // std::cout  << k << " " << num_lookup[k] << std::endl;
         }
     }
 
