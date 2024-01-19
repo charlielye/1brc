@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
               // This is our station name.
               std::string_view key_str(line_start, sc_pos - line_start);
               // std::cout << key_str << std::endl;
-              // Compute key for name. Costs about 15ms.
+              // Compute key for name.
               uint64_t key = hash_name(key_str);
 
               // Extract value.
@@ -297,7 +297,6 @@ int main(int argc, char** argv) {
               int nl_index = 4;
               nl_index += v_pos[5] == '\n';
               nl_index -= v_pos[3] == '\n';
-              // Costs about 60ms.
               auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
