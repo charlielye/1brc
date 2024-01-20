@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iostream>
 #include <fstream>
+#include <memory>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -31,6 +32,7 @@ using MaskType = __mmask64;
 const int VecSize = 64;
 #define VEC_SET1_EPI8 _mm512_set1_epi8
 #define VEC_LOADU_SI _mm512_loadu_si512
+#define VEC_LOAD_SI _mm512_load_si512
 #define VEC_CMPEQ_EPI8_MASK _mm512_cmpeq_epi8_mask
 #define VEC_MOVEMASK_EPI8 _mm512_movemask_epi8
 #define VEC_STORE_SI(buffer, data) _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data)
@@ -41,6 +43,7 @@ using MaskType = __mmask32;
 const int VecSize = 32;
 #define VEC_SET1_EPI8 _mm256_set1_epi8
 #define VEC_LOADU_SI _mm256_loadu_si256
+#define VEC_LOAD_SI _mm256_load_si256
 #define VEC_CMPEQ_EPI8_MASK(data, val) _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, val))
 #define VEC_STORE_SI(buffer, data) _mm256_store_si256(reinterpret_cast<__m256i*>(buffer), data)
 #define TZCNT _tzcnt_u32
@@ -48,6 +51,7 @@ const int VecSize = 32;
 
 #define yay(x) __builtin_expect(x, 1)
 #define nay(x) __builtin_expect(x, 0)
+#define inline inline __attribute__((always_inline))
 
 // It's a timer.
 class Timer {
@@ -72,6 +76,120 @@ private:
     std::chrono::time_point<std::chrono::high_resolution_clock> start_;
 };
 
+// It's a logger.
+template <typename... Args> void info(Args... args)
+{
+    std::ios_base::fmtflags f(std::cout.flags());
+    ((std::cout << args), ...) << std::endl;
+    std::cout.flags(f);
+}
+
+
+class lock_free_buffer {
+public:
+    lock_free_buffer(const std::string& filename, size_t start_offset, size_t length, int i)
+        : _spin_count(0)
+        , _file(filename, std::ios::binary)
+        , _bytes_read(0)
+        , _total_to_read(length)
+    {
+        // Alloc a buffer. round up to a neat simd vector size.
+        auto rounded_size = (length + VecSize - 1) & ~(VecSize - 1);
+        _start = (char*)std::aligned_alloc(VecSize, rounded_size);
+        // 0 set the padding.
+        memset(_start + length, 0, rounded_size - length);
+        // info("file buf range: 0x",
+        //     std::hex,
+        //     (uintptr_t)_start, "-0x",
+        //     (uintptr_t)_start + length, "-0x",
+        //     (uintptr_t)_start + rounded_size,
+        //     std::dec,
+        //     " offset: ", std::setw(8), start_offset,
+        //     " length: ", std::setw(8), length,
+        //     " padding: ", std::setw(2), rounded_size - length,
+        //     " alloc_size: ", rounded_size,
+        //     " simd_blocks: ", rounded_size / VecSize);
+        // info("dd if=", filename, " bs=1 skip=", start_offset, " count=", length, " | hexdump -C | less");
+
+        _file.seekg(start_offset, std::ios::beg);
+        _end = _start + length;
+        _write_position = _start;
+
+        read_chunk(1024*4);
+
+        // info("start: ", start_offset, " length: ", length);
+        // _thread = std::thread(&lock_free_buffer::read_file, this);
+        _thread = std::thread([=] {
+          // Set thread affinity to CPU core 'i'.
+          cpu_set_t cpuset;
+          CPU_ZERO(&cpuset);
+          CPU_SET(i, &cpuset);
+
+          int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+          if (rc != 0) {
+              std::cerr << "Error setting thread affinity: " << rc << std::endl;
+          }
+
+          read_file();
+      });
+    }
+
+    ~lock_free_buffer() {
+        _thread.join();
+        std::free(_start);
+    }
+
+    char* get_pointer_at(size_t index, size_t len) {
+        char* start = _start + index;
+        char* end = std::min(start + len, _end);
+        // std::cout << "enter spin" << std::endl;
+        while (_write_position.load(std::memory_order_acquire) < end) {
+            // Spin wait
+            _spin_count++;
+        }
+        // std::cout << "exit spin" << std::endl;
+        return start;
+    }
+
+    char* end() {
+      return _end;
+    }
+
+    uint64_t get_spins() const {
+      return _spin_count;
+    }
+
+private:
+    void read_chunk(size_t chunk) {
+        size_t bytes_to_read = std::min(chunk, _total_to_read - _bytes_read);
+        _file.read(_start + _bytes_read, bytes_to_read);
+        _bytes_read += bytes_to_read;
+        _write_position.store(_start + _bytes_read, std::memory_order_release);
+    }
+
+    void read_file() {
+        // read_chunk(1024*1024*10, bytes_read, total_to_read);
+        // info("starting read from: ", _file.tellg(), " to location ", std::hex, (uintptr_t)_start);
+
+        while (_bytes_read < _total_to_read) {
+            read_chunk(1024*4);
+            // if (bytes_read % (1024*1024*1024) == 0) {
+            //   std::cout << "read: " << bytes_read << std::endl;
+            // }
+        }
+        // std::cout << "read done: " << bytes_read << std::endl;
+    }
+
+    uint64_t _spin_count;
+    std::thread _thread;
+    std::ifstream _file;
+    char* _start;
+    char* _end;
+    std::atomic<char*> _write_position;
+    size_t _bytes_read;
+    size_t _total_to_read;
+};
+
 // A big 'ol number lookup table.
 constexpr int NUM_LOOKUP_TABLE_SIZE = 1<<15;
 int num_lookup[NUM_LOOKUP_TABLE_SIZE];
@@ -82,7 +200,7 @@ int num_lookup[NUM_LOOKUP_TABLE_SIZE];
 // -9.9n
 // 99.9n
 // 9.9n
-inline __attribute__((always_inline)) int gen_num_key(const char* data, int newline_index) {
+inline int gen_num_key(const char* data, int newline_index) {
     uint32_t i = *(uint32_t*)(data);
     uint32_t k = _mm_crc32_u32(0, i);
     if (nay(newline_index == 5)) k = _mm_crc32_u8(k, data[4]);
@@ -91,17 +209,17 @@ inline __attribute__((always_inline)) int gen_num_key(const char* data, int newl
 
 struct MinMaxAvg {
     std::string_view name;
-    uint32_t key;
+    // uint32_t key;
     int16_t min;
     int16_t max;
     int64_t sum;
     unsigned int count;
 
-    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), key(0) {}
+    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0)/*, key(0)*/ {}
 
     inline void update(std::string_view const& key_str, int _key, int16_t value) {
         name = key_str;
-        key = _key;
+        // key = _key;
         min = std::min(min, value);
         max = std::max(max, value);
         sum += value;
@@ -121,14 +239,22 @@ struct MinMaxAvg {
     }
 };
 
+// bool compare_512bit_strings(const char* str1, const char* str2) {
+//     __m512i v1 = _mm512_loadu_si512((const void*)str1);
+//     __m512i v2 = _mm512_loadu_si512((const void*)str2);
+//     __mmask64 result = _mm512_cmpeq_epi8_mask(v1, v2);
+//     return result == 0xFFFFFFFFFFFFFFFF;
+// }
+
 // 16384 entries times 32 bytes an entry is 524288 bytes.
 constexpr size_t HashMapSize = 1024 * 16;
 using MapIndex = uint64_t;
 using TheMap = MinMaxAvg[HashMapSize];
-inline MinMaxAvg* lookup(TheMap& map, MapIndex key) {
+inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
-    while (nay(entry->key && entry->key != key)) {
+    while (nay(!entry->name.empty() && entry->name != key_str)) {
+      // std::cout << "lookup collision: " << key_str << " with " << entry->name << std::endl;
       lookup_key = (lookup_key + 1) % HashMapSize;
       entry = &map[lookup_key];
     }
@@ -139,7 +265,7 @@ inline MinMaxAvg* lookup(TheMap& map, MapIndex key) {
 uint64_t hash_masks[101];
 uint64_t hash_masks2[101];
 
-inline  __attribute__((always_inline)) uint32_t hash_name(std::string_view const& name) {
+inline uint32_t hash_name(std::string_view const& name) {
     uint32_t key=0;
     auto len = name.size();
     auto data = ((uint64_t*)name.data());
@@ -159,53 +285,55 @@ inline  __attribute__((always_inline)) uint32_t hash_name(std::string_view const
 int main(int argc, char** argv) {
     auto t0 = Timer();
     std::vector<std::string> args(argv, argv + argc);
-
-    // Open the file
     std::string filename = args.size() > 1 ?  args[1] : "measurements.txt";
-    int fd = open(filename.c_str(), O_RDONLY);
-    if (fd == -1) {
-        std::cerr << "Error opening file" << std::endl;
-        return 1;
-    }
-
-    // Get file size
-    struct stat sb;
-    if (fstat(fd, &sb) == -1) {
-        std::cerr << "Error getting file size" << std::endl;
-        close(fd);
-        return 1;
-    }
-
-    // Memory map the file
-    char *map = static_cast<char*>(mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
-    if (map == MAP_FAILED) {
-        std::cerr << "Error mapping file" << std::endl;
-        close(fd);
-        return 1;
-    }
 
     // Determine the number of CPUs
     char* threads_str = std::getenv("THREADS");
-    unsigned num_cpus = threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
+    unsigned num_cpus = 2;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
 
-    // long pagesize = sysconf(_SC_PAGESIZE);
+    // Calculate start/end positions for each thread.
+    std::vector<size_t> file_positions(num_cpus+1, 0);
+    {
+      // Open the file
+      int fd = open(filename.c_str(), O_RDONLY);
+      if (fd == -1) {
+          std::cerr << "Error opening file" << std::endl;
+          return 1;
+      }
 
-    // Calculate starting positions for each thread.
-    std::vector<char*> starting_positions(num_cpus, map);
-    size_t chunk_size = sb.st_size / num_cpus;
-    for (unsigned i = 1; i < num_cpus; ++i) {
-        size_t pos = i * chunk_size;
-        while (map[pos++] != '\n');
-        auto start = map+pos;
-        starting_positions[i] = start;
+      // Get file size
+      struct stat sb;
+      if (fstat(fd, &sb) == -1) {
+          std::cerr << "Error getting file size" << std::endl;
+          close(fd);
+          return 1;
+      }
 
-        // Advise the kernel of access pattern (DOESN'T HELP).
-        // char* aligned_start = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(start) & ~(pagesize - 1));
-        // if (madvise(aligned_start, chunk_size, MADV_SEQUENTIAL) != 0) {
-        //     std::cerr << "Failed madvise." << std::endl;
-        //     exit(-1);
-        // }
+      // Memory map the file.
+      char *map = static_cast<char*>(mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
+      if (map == MAP_FAILED) {
+          std::cerr << "Error mapping file" << std::endl;
+          close(fd);
+          return 1;
+      }
+      madvise(map, sb.st_size, MADV_RANDOM);
+
+      size_t chunk_size = sb.st_size / num_cpus;
+      for (unsigned i = 1; i < num_cpus; ++i) {
+          size_t pos = i * chunk_size;
+          while (map[pos-1] != '\n') ++pos;
+          file_positions[i] = pos;
+      }
+      file_positions[num_cpus] = sb.st_size;
+
+      Timer blah;
+      munmap(map, sb.st_size);
+      info("unmap ", blah.milliseconds());
     }
+    // DEBUG START/END POSITIONS.
+    // for (auto f : file_positions) {
+    //   std::cout << f << std::endl;
+    // }
 
     // Compute number lookup table.
     for (int num = 0; num <= 99; ++num) {
@@ -260,13 +388,15 @@ int main(int argc, char** argv) {
     MinMaxAvg hash_map[HashMapSize];
     using MapIndex = uint64_t;
     using TheMap = decltype(hash_map);
-
+    // DEBUG SIZE OF HASHMAP
     // std::cout << sizeof(MinMaxAvg) << std::endl;
     // exit(0);
 
     // Main processing function for each thread.
-    auto process_chunk = [&](char* start, char* end, TheMap &result) {
-        char* it = start;
+    auto process_chunk = [&](lock_free_buffer& buf, TheMap &result, int i) {
+        size_t pos=0;
+        char* it = buf.get_pointer_at(pos, VecSize);
+        char* end = buf.end();
         int inner_counter = 0;
 
         const VecType semicolon = VEC_SET1_EPI8(';');
@@ -276,15 +406,15 @@ int main(int argc, char** argv) {
             // Prefetch data to be accessed in the future (DOESN'T HELP).
             // _mm_prefetch(it + VecSize, _MM_HINT_T0);
 
-            // Load 64 bytes unaligned into 512 bit register.
-            VecType data = VEC_LOADU_SI(reinterpret_cast<const VecType*>(it));
-
+            // Load aligned bytes into simd register.
+            VecType data = VEC_LOAD_SI(reinterpret_cast<const VecType*>(it));
             // DEBUG PRINT DATA
             // alignas(VecSize) char buffer[VecSize];
-            // VEC_STORE_SI(reinterpret_cast<__m512i*>(buffer), data);
-            // std::string str(buffer, 64);
+            // VEC_STORE_SI(reinterpret_cast<VecType*>(buffer), data);
+            // std::string str(buffer, VecSize);
             // std::replace(str.begin(), str.end(), '\n', ' ');
             // std::cout << str << std::endl;
+            // if (inner_counter % 1000000 == 0) std::cout << inner_counter << std::endl;
 
             // Compute mask of semicolon locations.
             MaskType sc_mask = VEC_CMPEQ_EPI8_MASK(data, semicolon);
@@ -305,47 +435,60 @@ int main(int argc, char** argv) {
               // Extract value.
               char* v_pos = sc_pos + 1;
               int nl_index = 4;
-              nl_index += v_pos[5] == '\n';
+              // TODO: maybe just overalloc the buffer to avoid range check?
+              nl_index += v_pos + 5 < end && v_pos[5] == '\n';
               nl_index -= v_pos[3] == '\n';
               auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
+              // std::cout << "len: " << key_str.size()  << " n: " << key_str << " k: " << key << " v: " << value << std::endl;
+
               // Locate entry in hashmap and update.
-              lookup(result, key)->update(key_str, key, value);
+              lookup(result, key, key_str)->update(key_str, key, value);
 
               // Remove this semicolon from the semicolon mask and loop back around.
               sc_mask &= ~(1ULL << sc_index);
               line_start = v_pos + nl_index + 1;
               ++inner_counter;
-              // std::cout << "len: " << key_str.size()  << " n: " << key_str << " k: " << key << " v: " << value << std::endl;
-              // if (inner_counter > 100) exit(0);
+              // if (inner_counter > 1000) exit(0);
             }
 
-            it += VecSize;
+            pos += VecSize;
+            it = buf.get_pointer_at(pos, VecSize);
         }
         counter += inner_counter;
+
+        info("Thread ", i, " spins: ", buf.get_spins());
     };
+
+    std::cout << "Setup: " << t0.milliseconds() << std::endl;
 
     // Launch threads
     auto t1 = Timer();
+    std::vector<std::unique_ptr<lock_free_buffer>> bufs(num_cpus);
     std::vector<std::thread> threads;
     std::vector<TheMap> thread_results(num_cpus);
     for (unsigned i = 0; i < num_cpus; ++i) {
-        char* start = starting_positions[i];
-        char* end = (i == num_cpus - 1) ? map + sb.st_size : starting_positions[i + 1];
-        threads.emplace_back([=, &thread_results] {
-          // Set thread affinity to CPU core 'i'
+        auto data_cpu = i + num_cpus;
+        auto logic_cpu = i;
+        auto start_offset = file_positions[i];
+        auto lfb = std::make_unique<lock_free_buffer>(filename, start_offset, file_positions[i+1] - start_offset, data_cpu);
+        bufs[i] = std::move(lfb); // To free later.
+
+        info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
+        threads.emplace_back([=, &thread_results, &bufs] {
+          // Set thread affinity to CPU core 'i'.
           cpu_set_t cpuset;
           CPU_ZERO(&cpuset);
-          CPU_SET(i, &cpuset);
+          CPU_SET(logic_cpu, &cpuset);
 
           int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
           if (rc != 0) {
               std::cerr << "Error setting thread affinity: " << rc << std::endl;
           }
 
-          // Call the processing function
-          process_chunk(start, end, std::ref(thread_results[i]));
+          // Call the processing function.
+          process_chunk(*bufs[i], std::ref(thread_results[i]), i);
       });
     }
 
@@ -362,7 +505,7 @@ int main(int argc, char** argv) {
     combined.reserve(HashMapSize);
     for (auto &thread_result : thread_results) {
         for (auto &kv : thread_result) {
-          if (!kv.key) continue;
+          if (kv.name.empty()) continue;
           auto& cr = combined[kv.name];
           if (kv.min < cr.min) cr.min = kv.min;
           if (kv.max > cr.max) cr.max = kv.max;
@@ -392,17 +535,17 @@ int main(int argc, char** argv) {
     auto t3r = t3.milliseconds();
 
     // Cleanup
-    auto t4 = Timer();
-    munmap(map, sb.st_size);
-    close(fd);
-    auto t4r = t4.milliseconds();
+    // auto t4 = Timer();
+    // munmap(map, sb.st_size);
+    // close(fd);
+    // auto t4r = t4.milliseconds();
     auto total = t0.milliseconds();
 
     std::cout << "  Threads: " << num_cpus << std::endl;
     std::cout << " Parallel: " << t1r << std::endl;
     std::cout << "Combining: " << t2r << std::endl;
     std::cout << "  Writing: " << t3r << std::endl;
-    std::cout << "    Unmap: " << t4r << std::endl;
+    // std::cout << "    Unmap: " << t4r << std::endl;
     std::cout << "    Total: " << total << std::endl;
     std::cout << "Processed: " << counter << std::endl;
 
