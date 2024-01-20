@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <crc32intrin.h>
 #include <cstdint>
 #include <cstring>
@@ -93,7 +94,7 @@ struct MinMaxAvg {
     uint32_t key;
     int16_t min;
     int16_t max;
-    int sum;
+    int64_t sum;
     unsigned int count;
 
     MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), key(0) {}
@@ -107,16 +108,16 @@ struct MinMaxAvg {
         ++count;
     }
 
-    float Min() const {
-        return (float)min / 10;
+    double Min() const {
+        return (double)min / 10;
     }
 
-    float Max() const {
-        return (float)max / 10;
+    double Max() const {
+        return (double)max / 10;
     }
 
-    float avg() const {
-        return count == 0 ? 0 : (float)sum / (count*10);
+    double avg() const {
+        return count == 0 ? 0 : round((double)sum / count) / 10;
     }
 };
 
@@ -207,20 +208,29 @@ int main(int argc, char** argv) {
     }
 
     // Compute number lookup table.
-    for (int num = -99; num <= 99; ++num) {
+    for (int num = 0; num <= 99; ++num) {
         for (int decimal = 0; decimal <= 9; ++decimal) {
             auto s = std::to_string(num) + "." + std::to_string(decimal) + '\n';
-            auto it = s.data();
-            auto k = gen_num_key(it, s.find('\n'));
+            auto k = gen_num_key(s.data(), s.find('\n'));
             if (nay(num_lookup[k] != 0)) {
               std::cout << "collision! " << k << " " << num_lookup[k] << std::endl;
               exit(1);
             }
+            num_lookup[k] = num * 10 + decimal;
+            // std::cout << s.substr(0, s.size() - 1) << " " << k << " " << num_lookup[k] << std::endl;
 
-            num_lookup[k] = num * 10 + (num < 0 ? -decimal : decimal);
-              // std::cout  << k << " " << num_lookup[k] << std::endl;
+            // Neg
+            s = "-" + s;
+            k = gen_num_key(s.data(), s.find('\n'));
+            if (nay(num_lookup[k] != 0)) {
+              std::cout << "collision! " << k << " " << num_lookup[k] << std::endl;
+              exit(1);
+            }
+            num_lookup[k] = -num * 10 - decimal;
+            // std::cout << s.substr(0, s.size() - 1) << " " << k << " " << num_lookup[k] << std::endl;
         }
     }
+    // exit(0);
 
     // Index by str len, hence we'll index from 1.
     for (int i=1; i<=100; ++i) {
