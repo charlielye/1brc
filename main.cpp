@@ -136,7 +136,11 @@ public:
 
     ~lock_free_buffer() {
         _thread.join();
-        std::free(_start);
+        free();
+    }
+
+    void free() {
+      std::free(_start);
     }
 
     char* get_pointer_at(size_t index, size_t len) {
@@ -168,6 +172,7 @@ private:
     }
 
     void read_file() {
+      auto t = Timer();
         // read_chunk(1024*1024*10, bytes_read, total_to_read);
         // info("starting read from: ", _file.tellg(), " to location ", std::hex, (uintptr_t)_start);
 
@@ -177,7 +182,7 @@ private:
             //   std::cout << "read: " << bytes_read << std::endl;
             // }
         }
-        // std::cout << "read done: " << bytes_read << std::endl;
+        // info("read done: ", t.milliseconds(), "ms");
     }
 
     uint64_t _spin_count;
@@ -209,17 +214,17 @@ inline int gen_num_key(const char* data, int newline_index) {
 
 struct MinMaxAvg {
     std::string_view name;
-    // uint32_t key;
+    uint32_t key;
     int16_t min;
     int16_t max;
     int64_t sum;
     unsigned int count;
 
-    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0)/*, key(0)*/ {}
+    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), key(0) {}
 
     inline void update(std::string_view const& key_str, int _key, int16_t value) {
         name = key_str;
-        // key = _key;
+        key = _key;
         min = std::min(min, value);
         max = std::max(max, value);
         sum += value;
@@ -253,7 +258,8 @@ using TheMap = MinMaxAvg[HashMapSize];
 inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
-    while (nay(!entry->name.empty() && entry->name != key_str)) {
+    // while (nay(!entry->name.empty() && entry->name != key_str)) {
+    while (nay(entry->key && entry->key != key)) {
       // std::cout << "lookup collision: " << key_str << " with " << entry->name << std::endl;
       lookup_key = (lookup_key + 1) % HashMapSize;
       entry = &map[lookup_key];
@@ -289,7 +295,7 @@ int main(int argc, char** argv) {
 
     // Determine the number of CPUs
     char* threads_str = std::getenv("THREADS");
-    unsigned num_cpus = 2;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
+    unsigned num_cpus = 64;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
 
     // Calculate start/end positions for each thread.
     std::vector<size_t> file_positions(num_cpus+1, 0);
@@ -326,9 +332,7 @@ int main(int argc, char** argv) {
       }
       file_positions[num_cpus] = sb.st_size;
 
-      Timer blah;
       munmap(map, sb.st_size);
-      info("unmap ", blah.milliseconds());
     }
     // DEBUG START/END POSITIONS.
     // for (auto f : file_positions) {
@@ -395,7 +399,8 @@ int main(int argc, char** argv) {
     // Main processing function for each thread.
     auto process_chunk = [&](lock_free_buffer& buf, TheMap &result, int i) {
         size_t pos=0;
-        char* it = buf.get_pointer_at(pos, VecSize);
+        // +6 because we read the number past the semicolon.
+        char* it = buf.get_pointer_at(pos, VecSize + 6);
         char* end = buf.end();
         int inner_counter = 0;
 
@@ -428,16 +433,15 @@ int main(int argc, char** argv) {
 
               // This is our station name.
               std::string_view key_str(line_start, sc_pos - line_start);
-              // std::cout << key_str << std::endl;
               // Compute key for name.
               uint64_t key = hash_name(key_str);
 
               // Extract value.
               char* v_pos = sc_pos + 1;
               int nl_index = 4;
-              // TODO: maybe just overalloc the buffer to avoid range check?
-              nl_index += v_pos + 5 < end && v_pos[5] == '\n';
+              nl_index += v_pos[5] == '\n';
               nl_index -= v_pos[3] == '\n';
+
               auto num_key = gen_num_key(v_pos, nl_index);
               auto value = num_lookup[num_key];
 
@@ -454,11 +458,11 @@ int main(int argc, char** argv) {
             }
 
             pos += VecSize;
-            it = buf.get_pointer_at(pos, VecSize);
+            it = buf.get_pointer_at(pos, VecSize + 6);
         }
         counter += inner_counter;
 
-        info("Thread ", i, " spins: ", buf.get_spins());
+        // info("Thread ", i, " spins: ", buf.get_spins());
     };
 
     std::cout << "Setup: " << t0.milliseconds() << std::endl;
@@ -475,7 +479,7 @@ int main(int argc, char** argv) {
         auto lfb = std::make_unique<lock_free_buffer>(filename, start_offset, file_positions[i+1] - start_offset, data_cpu);
         bufs[i] = std::move(lfb); // To free later.
 
-        info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
+        // info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
         threads.emplace_back([=, &thread_results, &bufs] {
           // Set thread affinity to CPU core 'i'.
           cpu_set_t cpuset;
@@ -505,7 +509,8 @@ int main(int argc, char** argv) {
     combined.reserve(HashMapSize);
     for (auto &thread_result : thread_results) {
         for (auto &kv : thread_result) {
-          if (kv.name.empty()) continue;
+          if (!kv.key) continue;
+          // if (kv.name.empty()) continue;
           auto& cr = combined[kv.name];
           if (kv.min < cr.min) cr.min = kv.min;
           if (kv.max > cr.max) cr.max = kv.max;
@@ -535,17 +540,19 @@ int main(int argc, char** argv) {
     auto t3r = t3.milliseconds();
 
     // Cleanup
-    // auto t4 = Timer();
+    auto t4 = Timer();
+    bufs.clear();
+    thread_results.clear();
     // munmap(map, sb.st_size);
     // close(fd);
-    // auto t4r = t4.milliseconds();
+    auto t4r = t4.milliseconds();
     auto total = t0.milliseconds();
 
     std::cout << "  Threads: " << num_cpus << std::endl;
     std::cout << " Parallel: " << t1r << std::endl;
     std::cout << "Combining: " << t2r << std::endl;
     std::cout << "  Writing: " << t3r << std::endl;
-    // std::cout << "    Unmap: " << t4r << std::endl;
+    std::cout << "    Clean: " << t4r << std::endl;
     std::cout << "    Total: " << total << std::endl;
     std::cout << "Processed: " << counter << std::endl;
 
