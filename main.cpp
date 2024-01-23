@@ -1,8 +1,6 @@
-#include <algorithm>
-#include <cmath>
-#include <crc32intrin.h>
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -11,42 +9,84 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
-#include <vector>
+// #include <vector>
 #include <atomic>
-#include <unordered_map>
+// #include <unordered_map>
 #include <string>
 #include <fcntl.h>
-#include <limits>
+// #include <limits>
+#include <bitset>
 
 #include <cstdio>
 #include <ctime>
 #include <string>
 #include <sys/resource.h>
 #include <sys/time.h>
-#include <nmmintrin.h>
-#include <immintrin.h>
 
-#ifdef __AVX512F__
-using VecType = __m512i;
-using MaskType = __mmask64;
-const int VecSize = 64;
-#define VEC_SET1_EPI8 _mm512_set1_epi8
-#define VEC_LOADU_SI _mm512_loadu_si512
-#define VEC_LOAD_SI _mm512_load_si512
-#define VEC_CMPEQ_EPI8_MASK _mm512_cmpeq_epi8_mask
-#define VEC_MOVEMASK_EPI8 _mm512_movemask_epi8
-#define VEC_STORE_SI(buffer, data) _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data)
-#define TZCNT _tzcnt_u64
+#undef __x86_64__
+#undef __aarch64__
+#define __aarch64__
+
+#if defined(__x86_64__)
+  #include <crc32intrin.h>
+  #include <nmmintrin.h>
+  #include <immintrin.h>
+  #ifdef __AVX512F__
+    using VecType = __m512i;
+    using MaskType = __mmask64;
+    const int VecSize = 64;
+    #define VEC_SET1_EPI8 _mm512_set1_epi8
+    #define VEC_LOADU_SI _mm512_loadu_si512
+    #define VEC_LOAD_SI _mm512_load_si512
+    #define VEC_CMPEQ_EPI8_MASK _mm512_cmpeq_epi8_mask
+    #define VEC_MOVEMASK_EPI8 _mm512_movemask_epi8
+    #define VEC_STORE_SI(buffer, data) _mm512_store_si512(reinterpret_cast<__m512i*>(buffer), data)
+    #define TZCNT _tzcnt_u64
+  #else
+    using VecType = __m256i;
+    using MaskType = __mmask32;
+    const int VecSize = 32;
+    #define VEC_SET1_EPI8 _mm256_set1_epi8
+    #define VEC_LOADU_SI _mm256_loadu_si256
+    #define VEC_LOAD_SI _mm256_load_si256
+    #define VEC_CMPEQ_EPI8_MASK(data, val) _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, val))
+    #define VEC_STORE_SI(buffer, data) _mm256_store_si256(reinterpret_cast<__m256i*>(buffer), data)
+    #define TZCNT _tzcnt_u32
+  #endif
+  #define CRC32_8 _mm_crc32_u8
+  #define CRC32_32 _mm_crc32_u32
+  #define CRC32_64 _mm_crc32_u64
+#elif defined(__aarch64__)
+  #include <arm_neon.h>
+  #include <arm_acle.h>
+
+  using VecType = uint8x16_t;
+  using MaskType = uint16_t;  // NEON lacks a direct equivalent to __mmask32. Using 16-bit mask for 16 8-bit elements.
+  const int VecSize = 16;     // Adjusted for 128-bit vector
+  #define VEC_SET1_EPI8 vdupq_n_s8
+
+  #define VEC_LOADU_SI(ptr) vld1q_s8(reinterpret_cast<const int8_t*>(ptr))
+  #define VEC_LOAD_SI(ptr) vld1q_s8(reinterpret_cast<const int8_t*>(ptr))
+
+  #define VEC_CMPEQ_EPI8_MASK(data, val) ({ \
+    uint8x16_t result_vec = vceqq_s8(data, val); \
+    uint16_t result_mask = 0; \
+    for (int i = 0; i < 16; ++i) { \
+        if (result_vec[i] != 0) { \
+            result_mask |= (1U << i); \
+        } \
+    } \
+    result_mask; \
+  })
+
+  #define VEC_STORE_SI(buffer, data) vst1q_s8(reinterpret_cast<int8_t*>(buffer), data)
+  #define TZCNT __builtin_ctz
+
+  #define CRC32_8 __crc32b
+  #define CRC32_32 __crc32w
+  #define CRC32_64 __crc32d
 #else
-using VecType = __m256i;
-using MaskType = __mmask32;
-const int VecSize = 32;
-#define VEC_SET1_EPI8 _mm256_set1_epi8
-#define VEC_LOADU_SI _mm256_loadu_si256
-#define VEC_LOAD_SI _mm256_load_si256
-#define VEC_CMPEQ_EPI8_MASK(data, val) _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, val))
-#define VEC_STORE_SI(buffer, data) _mm256_store_si256(reinterpret_cast<__m256i*>(buffer), data)
-#define TZCNT _tzcnt_u32
+  #error "Unsupported platform. CRC32 intrinsic not defined."
 #endif
 
 #define yay(x) __builtin_expect(x, 1)
@@ -228,30 +268,31 @@ public:
         // Close the file as it is no longer needed
         // close(fd);
 
-        _thread = std::thread([=] {
-          // Set thread affinity to CPU core 'i'.
-          cpu_set_t cpuset;
-          CPU_ZERO(&cpuset);
-          CPU_SET(i, &cpuset);
-
-          int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-          if (rc != 0) {
-              std::cerr << "Error setting thread affinity: " << rc << std::endl;
-          }
-
-          unmap();
-        });
+//         _thread = std::thread([=, this] {
+//           // Set thread affinity to CPU core 'i'.
+// #if defined(__x86_64__)
+//           cpu_set_t cpuset;
+//           CPU_ZERO(&cpuset);
+//           CPU_SET(i, &cpuset);
+//
+//           int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+//           if (rc != 0) {
+//               std::cerr << "Error setting thread affinity: " << rc << std::endl;
+//           }
+// #endif
+//           unmap();
+//         });
     }
 
     ~lock_free_buffer() {
       munmap(_map, _total_to_read);
       _running = false;
-      _thread.join();
+      // _thread.join();
     }
 
     char* get_pointer_at(size_t index, size_t len) {
         // We may need ~100 bytes of history for long lines, rounding up to 128.
-        _processed_length.fetch_add(1);
+        // _processed_length.fetch_add(1);
         return _start + index;
     }
 
@@ -296,8 +337,8 @@ int num_lookup[NUM_LOOKUP_TABLE_SIZE];
 // 9.9n
 inline int gen_num_key(const char* data, int newline_index) {
     uint32_t i = *(uint32_t*)(data);
-    uint32_t k = _mm_crc32_u32(0, i);
-    if (nay(newline_index == 5)) k = _mm_crc32_u8(k, data[4]);
+    uint32_t k = CRC32_32(0, i);
+    if (nay(newline_index == 5)) k = CRC32_8(k, data[4]);
     return k % NUM_LOOKUP_TABLE_SIZE;
 }
 
@@ -343,7 +384,7 @@ struct MinMaxAvg {
 // 16384 entries times 32 bytes an entry is 524288 bytes.
 constexpr size_t HashMapSize = 1024 * 16;
 using MapIndex = uint64_t;
-using TheMap = MinMaxAvg[HashMapSize];
+using TheMap = std::array<MinMaxAvg, HashMapSize>;
 inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
@@ -366,12 +407,12 @@ inline uint32_t hash_name(std::string_view const& name) {
     auto data = ((uint64_t*)name.data());
     auto key1 = data[0] & hash_masks[len];
     auto key2 = data[1] & hash_masks2[len];
-    key = _mm_crc32_u64(0, key1);
-    key = _mm_crc32_u64(key, key2);
+    key = CRC32_64(0, key1);
+    key = CRC32_64(key, key2);
     if (nay(len > 16)) {
       // Names longer than 16 bytes are an edge case.
       for (int i=16; i<len; ++i) {
-        key = _mm_crc32_u8(key, name[i]);
+        key = CRC32_8(key, name[i]);
       }
     }
     return key;
@@ -384,7 +425,7 @@ int main(int argc, char** argv) {
 
     // Determine the number of CPUs
     char* threads_str = std::getenv("THREADS");
-    unsigned num_cpus = 32 ;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
+    unsigned num_cpus = 8 ;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
 
     // Calculate start/end positions for each thread.
     std::vector<size_t> file_positions(num_cpus+1, 0);
@@ -470,7 +511,7 @@ int main(int argc, char** argv) {
     }
     // DEBUG HASH MASKS.
     // for (int i=1; i<101; ++i) {
-    //   std::cout << std::setw(16) << std::setfill('0') << std::hex << hash_masks2[i] << 
+    //   std::cout << std::setw(16) << std::setfill('0') << std::hex << hash_masks2[i] <<
     //     std::setw(16) << std::setfill('0') << std::hex << hash_masks[i] << std::endl;
     // }
 
@@ -478,7 +519,7 @@ int main(int argc, char** argv) {
 
     // 16384 entries times 32 bytes and entry is 524288 bytes.
     constexpr size_t HashMapSize = 1024 * 16;
-    MinMaxAvg hash_map[HashMapSize];
+    TheMap hash_map;
     using MapIndex = uint64_t;
     using TheMap = decltype(hash_map);
     // DEBUG SIZE OF HASHMAP
@@ -512,7 +553,10 @@ int main(int argc, char** argv) {
 
             // Compute mask of semicolon locations.
             MaskType sc_mask = VEC_CMPEQ_EPI8_MASK(data, semicolon);
-            
+            // std::bitset<VecSize> bs(sc_mask);
+            // auto bs_str = bs.to_string();
+            // info(std::string(bs_str.rbegin(),  bs_str.rend()));
+
             // Loop once for each found semicolon.
             while (yay(sc_mask)) {
               int sc_index = TZCNT(sc_mask);
@@ -570,6 +614,7 @@ int main(int argc, char** argv) {
 
         // info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
         threads.emplace_back([=, &thread_results, &bufs] {
+#if defined(__x86_64__)
           // Set thread affinity to CPU core 'i'.
           cpu_set_t cpuset;
           CPU_ZERO(&cpuset);
@@ -579,7 +624,7 @@ int main(int argc, char** argv) {
           if (rc != 0) {
               std::cerr << "Error setting thread affinity: " << rc << std::endl;
           }
-
+#endif
           // Call the processing function.
           process_chunk(*bufs[i], std::ref(thread_results[i]), i);
       });
