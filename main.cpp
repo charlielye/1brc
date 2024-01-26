@@ -1,17 +1,19 @@
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <array>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
-#include <memory>
+// #include <memory>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
-// #include <vector>
+#include <vector>
 #include <atomic>
-// #include <unordered_map>
+#include <unordered_map>
+#include <algorithm>
 #include <string>
 #include <fcntl.h>
 // #include <limits>
