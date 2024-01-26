@@ -15,7 +15,7 @@
 #include <string>
 #include <fcntl.h>
 // #include <limits>
-#include <bitset>
+// #include <bitset>
 
 #include <cstdio>
 #include <ctime>
@@ -23,9 +23,9 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 
-#undef __x86_64__
-#undef __aarch64__
-#define __aarch64__
+// #undef __x86_64__
+// #undef __aarch64__
+// #define __aarch64__
 
 #if defined(__x86_64__)
   #include <crc32intrin.h>
@@ -266,7 +266,7 @@ public:
         _end = _start + length;
 
         // Close the file as it is no longer needed
-        // close(fd);
+        close(fd);
 
 //         _thread = std::thread([=, this] {
 //           // Set thread affinity to CPU core 'i'.
