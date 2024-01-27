@@ -349,18 +349,17 @@ inline int gen_num_key(const char* data, int newline_index) {
 // L1d: 48k data per physical core.
 // Each cache line is 64 bytes wide.
 struct alignas(64) MinMaxAvg {
-    std::string_view name;
-    uint32_t key;
     int16_t min;
     int16_t max;
     unsigned int count;
     int64_t sum;
+    std::string name;
 
-    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), key(0) {}
+    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0) {}
 
     inline void update(std::string_view const& key_str, int _key, int16_t value) {
-        name = key_str;
-        key = _key;
+        if (nay(name.empty())) name = key_str;
+        // key = _key;
         min = std::min(min, value);
         max = std::max(max, value);
         sum += value;
@@ -601,11 +600,10 @@ int main(int argc, char** argv) {
             it += VecSize;
             // it = buf.get_pointer_at(pos, VecSize + 6);
 
-            // WARNING: At present this requires all station names to have been listed in last 10mb.
-            // Solve by simd copying strings into table entries. Needed for hash collisions anyway.
             constexpr size_t UNMAP_SIZE = 1024*1024*10;
-            if (nay((pos % (UNMAP_SIZE*2)) == 0)) {
-              buf.unmap(pos-UNMAP_SIZE);
+            if (nay((pos % (UNMAP_SIZE)) == 0)) {
+              // Leave 1 page to back ref line_start.
+              buf.unmap(pos-4096);
             }
         }
         counter += inner_counter;
