@@ -395,7 +395,8 @@ inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
     // While we have bucket collison, linear probe forward until find matching hash, or empty.
-    while (nay(entry->key && entry->key != key)) {
+    while (nay(!entry->name.empty() && entry->name != key_str)) {
+    // while (nay(entry->key && entry->key != key)) {
       // std::cout << "lookup collision: " << key_str << " with " << entry->name << std::endl;
       lookup_key = (lookup_key + 1) % HashMapSize;
       entry = &map[lookup_key];
