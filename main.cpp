@@ -298,18 +298,19 @@ public:
         return _start + index;
     }
 
-    void unmap() {
-      while(_running) {
-        const size_t unmap_size = 1024*1024 * VecSize;
-        auto ps = _processed_length.load();
-        if ((ps % (1024*1024)) == 0) {
+    void unmap(size_t pos) {
+      // while(_running) {
+      //   const size_t unmap_size = 1024*1024 * VecSize;
+      //   auto ps = _processed_length.load();
+      //   if ((ps % (1024*1024)) == 0) {
           // info("unmapping ", ps);
-          munmap(_map, (ps-1) * VecSize);
+          // Timer t;
+          auto r = munmap(_map, pos);
           // _unmap_pos += unmap_size;
-          // info("unmapped");
-        }
+          // info("unmapped: ", r, " ", pos, " ", t.milliseconds());
+        // }
         // std::this_thread::yield();
-      }
+      // }
     }
 
     char* end() {
@@ -344,18 +345,21 @@ inline int gen_num_key(const char* data, int newline_index) {
     return k % NUM_LOOKUP_TABLE_SIZE;
 }
 
-struct MinMaxAvg {
-    std::string name;
+// L1i: 32k data per physical core.
+// L1d: 48k data per physical core.
+// Each cache line is 64 bytes wide.
+struct alignas(64) MinMaxAvg {
+    std::string_view name;
     uint32_t key;
     int16_t min;
     int16_t max;
-    int64_t sum;
     unsigned int count;
+    int64_t sum;
 
     MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), key(0) {}
 
     inline void update(std::string_view const& key_str, int _key, int16_t value) {
-        if (name.empty()) name = key_str;
+        name = key_str;
         key = _key;
         min = std::min(min, value);
         max = std::max(max, value);
@@ -390,7 +394,7 @@ using TheMap = std::array<MinMaxAvg, HashMapSize>;
 inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
-    // while (nay(!entry->name.empty() && entry->name != key_str)) {
+    // While we have bucket collison, linear probe forward until find matching hash, or empty.
     while (nay(entry->key && entry->key != key)) {
       // std::cout << "lookup collision: " << key_str << " with " << entry->name << std::endl;
       lookup_key = (lookup_key + 1) % HashMapSize;
@@ -544,7 +548,7 @@ int main(int argc, char** argv) {
             // _mm_prefetch(it + VecSize, _MM_HINT_T0);
 
             // Load aligned bytes into simd register.
-            VecType data = VEC_LOAD_SI(reinterpret_cast<const VecType*>(it));
+            VecType data = VEC_LOADU_SI(reinterpret_cast<const VecType*>(it));
             // DEBUG PRINT DATA
             // alignas(VecSize) char buffer[VecSize];
             // VEC_STORE_SI(reinterpret_cast<VecType*>(buffer), data);
@@ -593,7 +597,15 @@ int main(int argc, char** argv) {
             }
 
             pos += VecSize;
-            it = buf.get_pointer_at(pos, VecSize + 6);
+            it += VecSize;
+            // it = buf.get_pointer_at(pos, VecSize + 6);
+
+            // WARNING: At present this requires all station names to have been listed in last 10mb.
+            // Solve by simd copying strings into table entries. Needed for hash collisions anyway.
+            constexpr size_t UNMAP_SIZE = 1024*1024*10;
+            if (nay((pos % (UNMAP_SIZE*2)) == 0)) {
+              buf.unmap(pos-UNMAP_SIZE);
+            }
         }
         counter += inner_counter;
 
@@ -645,8 +657,7 @@ int main(int argc, char** argv) {
     combined.reserve(HashMapSize);
     for (auto &thread_result : thread_results) {
         for (auto &kv : thread_result) {
-          if (!kv.key) continue;
-          // if (kv.name.empty()) continue;
+          if (kv.name.empty()) continue;
           auto& cr = combined[kv.name];
           if (kv.min < cr.min) cr.min = kv.min;
           if (kv.max > cr.max) cr.max = kv.max;
