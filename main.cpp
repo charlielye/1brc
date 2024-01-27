@@ -257,7 +257,10 @@ public:
         size_t page_size = sysconf(_SC_PAGE_SIZE);
         size_t aligned_offset = start_offset - (start_offset % page_size);
         size_t offset_difference = start_offset - aligned_offset;
-        _map = static_cast<char*>(mmap(nullptr, length + offset_difference, PROT_READ, MAP_PRIVATE, fd, aligned_offset));
+        size_t adjusted_length = length + offset_difference;
+        // adjusted_length = (adjusted_length + page_size - 1) / page_size * page_size;
+        adjusted_length = ((adjusted_length + page_size - 1) / page_size + 1) * page_size;
+        _map = static_cast<char*>(mmap(nullptr, adjusted_length, PROT_READ, MAP_PRIVATE, fd, aligned_offset));
         if (_start == MAP_FAILED) {
             std::cerr << "Error mapping file: " << strerror(errno) << std::endl;
             _start = nullptr;
@@ -270,47 +273,33 @@ public:
         // Close the file as it is no longer needed
         close(fd);
 
-//         _thread = std::thread([=, this] {
-//           // Set thread affinity to CPU core 'i'.
-// #if defined(__x86_64__)
-//           cpu_set_t cpuset;
-//           CPU_ZERO(&cpuset);
-//           CPU_SET(i, &cpuset);
-//
-//           int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-//           if (rc != 0) {
-//               std::cerr << "Error setting thread affinity: " << rc << std::endl;
-//           }
-// #endif
-//           unmap();
-//         });
+        info(i, " file buf range: 0x",
+            std::hex,
+            (uintptr_t)_map, "-0x",
+            (uintptr_t)_start, "-0x",
+            (uintptr_t)_end,
+            // (uintptr_t)_start + rounded_size,
+            std::dec,
+            " offset: ", std::setw(8), start_offset,
+            " length: ", std::setw(8), length);
+            // " padding: ", std::setw(2), rounded_size - length,
+            // " alloc_size: ", rounded_size,
+            // " simd_blocks: ", rounded_size / VecSize);
+        info("dd if=", filename, " bs=1 skip=", aligned_offset, " count=", length+offset_difference, " | hexdump -C | less");
     }
 
     ~lock_free_buffer() {
       munmap(_map, _total_to_read);
-      _running = false;
-      // _thread.join();
     }
 
     char* get_pointer_at(size_t index, size_t len) {
-        // We may need ~100 bytes of history for long lines, rounding up to 128.
-        // _processed_length.fetch_add(1);
         return _start + index;
     }
 
     void unmap(size_t pos) {
-      // while(_running) {
-      //   const size_t unmap_size = 1024*1024 * VecSize;
-      //   auto ps = _processed_length.load();
-      //   if ((ps % (1024*1024)) == 0) {
-          // info("unmapping ", ps);
-          // Timer t;
-          auto r = munmap(_map, pos);
-          // _unmap_pos += unmap_size;
-          // info("unmapped: ", r, " ", pos, " ", t.milliseconds());
-        // }
-        // std::this_thread::yield();
-      // }
+        // Timer t;
+        auto r = munmap(_map, pos);
+        // info("unmapped: ", r, " ", pos, " ", t.milliseconds());
     }
 
     char* end() {
@@ -345,21 +334,73 @@ inline int gen_num_key(const char* data, int newline_index) {
     return k % NUM_LOOKUP_TABLE_SIZE;
 }
 
-// L1i: 32k data per physical core.
+// Index by str len, hence we'll index from 1.
+uint64_t hash_masks[101];
+uint64_t hash_masks2[101];
+
+// TODO: flexible simd
+bool compare_strings(const char* source, size_t source_len, const char* target) {
+  if (nay(source_len > 16)) {
+    return memcmp(source, target, source_len) == 0;
+  }
+  uint64_t s1 = ((uint64_t*)source)[0] & hash_masks[source_len];
+  uint64_t s2 = ((uint64_t*)source)[1] & hash_masks2[source_len];
+  uint64_t t1 = ((uint64_t*)target)[0];
+  uint64_t t2 = ((uint64_t*)target)[1];
+  return s1 == t1 && s2 == t2;
+
+  // while (source[i] != 0 && source[i] == target[i]) ++i;
+  // return i == source_len;
+
+    // return memcmp(source, target, source_len) == 0;
+    // constexpr int block_size = 32;  // Size of SIMD register block
+    //
+    // for (int i = 0; i < source_len; i += block_size) {
+    //     // Load block from source
+    //     __m256i block_source = _mm256_loadu_si256((__m256i*)(source + i));
+    //
+    //     // Apply mask to the last block if source length is not a multiple of 32
+    //     if (i + block_size > source_len) {
+    //         __m256i mask;
+    //         char temp_mask[block_size];
+    //         for (int j = 0; j < block_size; ++j) {
+    //             temp_mask[j] = (i + j < source_len) ? 0xFF : 0x00;
+    //         }
+    //         mask = _mm256_loadu_si256((__m256i*)temp_mask);
+    //         block_source = _mm256_and_si256(block_source, mask);
+    //     }
+    //
+    //     // Load block from target
+    //     __m256i block_target = _mm256_loadu_si256((__m256i*)(target + i));
+    //
+    //     // Compare blocks
+    //     __m256i result = _mm256_cmpeq_epi8(block_source, block_target);
+    //
+    //     // Check if all bytes in the result are 1s (indicating a match)
+    //     if (!_mm256_testc_si256(result, _mm256_set1_epi8(-1))) {
+    //         return false;  // Mismatch found
+    //     }
+    // }
+    //
+    // return true;  // All blocks matched
+}
+
 // L1d: 48k data per physical core.
 // Each cache line is 64 bytes wide.
+// Each entry will take a total of 2 cache lines (117/128 bytes).
 struct alignas(64) MinMaxAvg {
     int16_t min;
     int16_t max;
     unsigned int count;
     int64_t sum;
-    std::string name;
+    alignas(8) char name[101] = {};
 
     MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0) {}
 
     inline void update(std::string_view const& key_str, int _key, int16_t value) {
-        if (nay(name.empty())) name = key_str;
-        // key = _key;
+      // TODO: simd copy
+        if (nay(name[0] == 0)) memcpy(name, key_str.data(), key_str.length());
+        // info(name);
         min = std::min(min, value);
         max = std::max(max, value);
         sum += value;
@@ -386,15 +427,16 @@ struct alignas(64) MinMaxAvg {
 //     return result == 0xFFFFFFFFFFFFFFFF;
 // }
 
-// 16384 entries times 32 bytes an entry is 524288 bytes.
+// 16384 entries times 128 bytes is 2MB.
+// L2 cache is 2mb per core so it should fit.
 constexpr size_t HashMapSize = 1024 * 16;
 using MapIndex = uint64_t;
 using TheMap = std::array<MinMaxAvg, HashMapSize>;
 inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
-    // While we have bucket collison, linear probe forward until find matching hash, or empty.
-    while (nay(!entry->name.empty() && entry->name != key_str)) {
+    // While we have bucket collison, linear probe forward while there is name that doesn't match.
+    while (nay(entry->name[0] != 0 && !compare_strings(key_str.data(), key_str.length(), entry->name))) {
     // while (nay(entry->key && entry->key != key)) {
       // std::cout << "lookup collision: " << key_str << " with " << entry->name << std::endl;
       lookup_key = (lookup_key + 1) % HashMapSize;
@@ -402,10 +444,6 @@ inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_
     }
     return entry;
 }
-
-// Index by str len, hence we'll index from 1.
-uint64_t hash_masks[101];
-uint64_t hash_masks2[101];
 
 inline uint32_t hash_name(std::string_view const& name) {
     uint32_t key=0;
@@ -431,7 +469,7 @@ int main(int argc, char** argv) {
 
     // Determine the number of CPUs
     char* threads_str = std::getenv("THREADS");
-    unsigned num_cpus = 8 ;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
+    unsigned num_cpus = threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
 
     // Calculate start/end positions for each thread.
     std::vector<size_t> file_positions(num_cpus+1, 0);
@@ -619,10 +657,9 @@ int main(int argc, char** argv) {
     std::vector<TheMap> thread_results(num_cpus);
     auto t1 = Timer();
     for (unsigned i = 0; i < num_cpus; ++i) {
-        auto data_cpu = i + num_cpus;
         auto logic_cpu = i;
         auto start_offset = file_positions[i];
-        auto lfb = std::make_unique<lock_free_buffer>(filename, start_offset, file_positions[i+1] - start_offset, data_cpu);
+        auto lfb = std::make_unique<lock_free_buffer>(filename, start_offset, file_positions[i+1] - start_offset, logic_cpu);
         bufs[i] = std::move(lfb); // To free later.
 
         // info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
@@ -656,7 +693,7 @@ int main(int argc, char** argv) {
     combined.reserve(HashMapSize);
     for (auto &thread_result : thread_results) {
         for (auto &kv : thread_result) {
-          if (kv.name.empty()) continue;
+          if (!kv.name[0]) continue;
           auto& cr = combined[kv.name];
           if (kv.min < cr.min) cr.min = kv.min;
           if (kv.max > cr.max) cr.max = kv.max;
