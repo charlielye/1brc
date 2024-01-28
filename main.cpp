@@ -126,125 +126,11 @@ template <typename... Args> void info(Args... args)
     std::cout.flags(f);
 }
 
-
-// class lock_free_buffer {
-// public:
-//     lock_free_buffer(const std::string& filename, size_t start_offset, size_t length, int i)
-//         : _spin_count(0)
-//         , _file(filename, std::ios::binary)
-//         , _bytes_read(0)
-//         , _total_to_read(length)
-//     {
-//         // Alloc a buffer. round up to a neat simd vector size.
-//         auto rounded_size = (length + VecSize - 1) & ~(VecSize - 1);
-//         _start = (char*)std::aligned_alloc(VecSize, rounded_size);
-//         // 0 set the padding.
-//         memset(_start + length, 0, rounded_size - length);
-//         // info("file buf range: 0x",
-//         //     std::hex,
-//         //     (uintptr_t)_start, "-0x",
-//         //     (uintptr_t)_start + length, "-0x",
-//         //     (uintptr_t)_start + rounded_size,
-//         //     std::dec,
-//         //     " offset: ", std::setw(8), start_offset,
-//         //     " length: ", std::setw(8), length,
-//         //     " padding: ", std::setw(2), rounded_size - length,
-//         //     " alloc_size: ", rounded_size,
-//         //     " simd_blocks: ", rounded_size / VecSize);
-//         // info("dd if=", filename, " bs=1 skip=", start_offset, " count=", length, " | hexdump -C | less");
-//
-//         _file.seekg(start_offset, std::ios::beg);
-//         _end = _start + length;
-//         _write_position = _start;
-//
-//         read_chunk(1024*4);
-//
-//         // info("start: ", start_offset, " length: ", length);
-//         // _thread = std::thread(&lock_free_buffer::read_file, this);
-//         _thread = std::thread([=] {
-//           // Set thread affinity to CPU core 'i'.
-//           cpu_set_t cpuset;
-//           CPU_ZERO(&cpuset);
-//           CPU_SET(i, &cpuset);
-//
-//           int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-//           if (rc != 0) {
-//               std::cerr << "Error setting thread affinity: " << rc << std::endl;
-//           }
-//
-//           read_file();
-//       });
-//     }
-//
-//     ~lock_free_buffer() {
-//         _thread.join();
-//         free();
-//     }
-//
-//     void free() {
-//       std::free(_start);
-//     }
-//
-//     char* get_pointer_at(size_t index, size_t len) {
-//         char* start = _start + index;
-//         char* end = std::min(start + len, _end);
-//         // std::cout << "enter spin" << std::endl;
-//         while (_write_position.load(std::memory_order_acquire) < end) {
-//             // Spin wait
-//             _spin_count++;
-//         }
-//         // std::cout << "exit spin" << std::endl;
-//         return start;
-//     }
-//
-//     char* end() {
-//       return _end;
-//     }
-//
-//     uint64_t get_spins() const {
-//       return _spin_count;
-//     }
-//
-// private:
-//     void read_chunk(size_t chunk) {
-//         size_t bytes_to_read = std::min(chunk, _total_to_read - _bytes_read);
-//         _file.read(_start + _bytes_read, bytes_to_read);
-//         _bytes_read += bytes_to_read;
-//         _write_position.store(_start + _bytes_read, std::memory_order_release);
-//     }
-//
-//     void read_file() {
-//       auto t = Timer();
-//         // read_chunk(1024*1024*10, bytes_read, total_to_read);
-//         // info("starting read from: ", _file.tellg(), " to location ", std::hex, (uintptr_t)_start);
-//
-//         while (_bytes_read < _total_to_read) {
-//             read_chunk(1024*4);
-//             // if (bytes_read % (1024*1024*1024) == 0) {
-//             //   std::cout << "read: " << bytes_read << std::endl;
-//             // }
-//         }
-//         // info("read done: ", t.milliseconds(), "ms");
-//     }
-//
-//     uint64_t _spin_count;
-//     std::thread _thread;
-//     std::ifstream _file;
-//     char* _start;
-//     char* _end;
-//     std::atomic<char*> _write_position;
-//     size_t _bytes_read;
-//     size_t _total_to_read;
-// };
-
-class lock_free_buffer {
+class data_buffer {
 public:
-    lock_free_buffer(const std::string& filename, size_t start_offset, size_t length, int i)
-        : _start(nullptr)
-        , _map(nullptr)
-        , _end(nullptr)
+    data_buffer(const std::string& filename, size_t start_offset, size_t length, int i)
+        : _i(i)
         , _total_to_read(length)
-        , _unmap_pos(0)
     {
         // Open file
         int fd = open(filename.c_str(), O_RDONLY);
@@ -258,48 +144,59 @@ public:
         size_t aligned_offset = start_offset - (start_offset % page_size);
         size_t offset_difference = start_offset - aligned_offset;
         size_t adjusted_length = length + offset_difference;
-        // adjusted_length = (adjusted_length + page_size - 1) / page_size * page_size;
-        adjusted_length = ((adjusted_length + page_size - 1) / page_size + 1) * page_size;
-        _map = static_cast<char*>(mmap(nullptr, adjusted_length, PROT_READ, MAP_PRIVATE, fd, aligned_offset));
-        if (_start == MAP_FAILED) {
+        adjusted_length += page_size - (adjusted_length % page_size);
+        _mapped_start = static_cast<char*>(mmap(nullptr, adjusted_length, PROT_READ, MAP_PRIVATE, fd, aligned_offset));
+        if (_aligned_start == MAP_FAILED) {
             std::cerr << "Error mapping file: " << strerror(errno) << std::endl;
             _start = nullptr;
             close(fd);
-            return;
+            exit(1);
         }
-        _start = _map + offset_difference;
+        _aligned_start = _mapped_start;
+        _start = _aligned_start + offset_difference;
         _end = _start + length;
+        _aligned_end = _aligned_start + adjusted_length;
 
         // Close the file as it is no longer needed
         close(fd);
 
         info(i, " file buf range: 0x",
             std::hex,
-            (uintptr_t)_map, "-0x",
+            (uintptr_t)_aligned_start, "-0x",
             (uintptr_t)_start, "-0x",
-            (uintptr_t)_end,
-            // (uintptr_t)_start + rounded_size,
+            (uintptr_t)_end, "-0x",
+            (uintptr_t)(_aligned_end),
             std::dec,
             " offset: ", std::setw(8), start_offset,
             " length: ", std::setw(8), length);
             // " padding: ", std::setw(2), rounded_size - length,
             // " alloc_size: ", rounded_size,
             // " simd_blocks: ", rounded_size / VecSize);
-        info("dd if=", filename, " bs=1 skip=", aligned_offset, " count=", length+offset_difference, " | hexdump -C | less");
+        // info("dd if=", filename, " bs=1 skip=", aligned_offset, " count=", length+offset_difference, " | hexdump -C | less");
+
+        // Remove mem protection on one page past the end of the mapping for overreads.
+        if (mprotect(_aligned_end, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
+            info("Error changing page protection: ", strerror(errno), " ", std::hex, (uintptr_t)_aligned_end);
+            // exit(1);
+        }
     }
 
-    ~lock_free_buffer() {
-      munmap(_map, _total_to_read);
+    ~data_buffer() {
+      munmap(_mapped_start, _aligned_end - _mapped_start);
     }
 
     char* get_pointer_at(size_t index, size_t len) {
         return _start + index;
     }
 
-    void unmap(size_t pos) {
-        // Timer t;
-        auto r = munmap(_map, pos);
-        // info("unmapped: ", r, " ", pos, " ", t.milliseconds());
+    void unmap(size_t len_to_unmap) {
+        Timer t;
+        auto r = munmap(_mapped_start, len_to_unmap);
+        // auto r = munmap(_aligned_start, (_mapped_start - _aligned_start) + len_to_unmap);
+        // info(std::dec, _i, " unmapped: ", r, " ", std::hex, 
+        //     (uintptr_t)_mapped_start, "-",
+        //     (uintptr_t)_mapped_start + len_to_unmap, std::dec, " ", t.milliseconds());
+        _mapped_start += len_to_unmap;
     }
 
     char* end() {
@@ -307,14 +204,14 @@ public:
     }
 
 private:
-    size_t _unmap_pos;
+    int _i;
     std::atomic_size_t _processed_length;
+    char* _mapped_start;
+    char* _aligned_start;
     char* _start;
-    char* _map;
     char* _end;
+    char* _aligned_end;
     size_t _total_to_read;
-    std::thread _thread;
-    std::atomic<bool> _running=true;
 };
 
 // A big 'ol number lookup table.
@@ -348,41 +245,6 @@ bool compare_strings(const char* source, size_t source_len, const char* target) 
   uint64_t t1 = ((uint64_t*)target)[0];
   uint64_t t2 = ((uint64_t*)target)[1];
   return s1 == t1 && s2 == t2;
-
-  // while (source[i] != 0 && source[i] == target[i]) ++i;
-  // return i == source_len;
-
-    // return memcmp(source, target, source_len) == 0;
-    // constexpr int block_size = 32;  // Size of SIMD register block
-    //
-    // for (int i = 0; i < source_len; i += block_size) {
-    //     // Load block from source
-    //     __m256i block_source = _mm256_loadu_si256((__m256i*)(source + i));
-    //
-    //     // Apply mask to the last block if source length is not a multiple of 32
-    //     if (i + block_size > source_len) {
-    //         __m256i mask;
-    //         char temp_mask[block_size];
-    //         for (int j = 0; j < block_size; ++j) {
-    //             temp_mask[j] = (i + j < source_len) ? 0xFF : 0x00;
-    //         }
-    //         mask = _mm256_loadu_si256((__m256i*)temp_mask);
-    //         block_source = _mm256_and_si256(block_source, mask);
-    //     }
-    //
-    //     // Load block from target
-    //     __m256i block_target = _mm256_loadu_si256((__m256i*)(target + i));
-    //
-    //     // Compare blocks
-    //     __m256i result = _mm256_cmpeq_epi8(block_source, block_target);
-    //
-    //     // Check if all bytes in the result are 1s (indicating a match)
-    //     if (!_mm256_testc_si256(result, _mm256_set1_epi8(-1))) {
-    //         return false;  // Mismatch found
-    //     }
-    // }
-    //
-    // return true;  // All blocks matched
 }
 
 // L1d: 48k data per physical core.
@@ -394,6 +256,7 @@ struct alignas(64) MinMaxAvg {
     unsigned int count;
     int64_t sum;
     alignas(8) char name[101] = {};
+    char padding[11];
 
     MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0) {}
 
@@ -419,6 +282,8 @@ struct alignas(64) MinMaxAvg {
         return count == 0 ? 0 : round((double)sum / count) / 10;
     }
 };
+
+static_assert(sizeof(MinMaxAvg) == 128, "MinMaxAvg not 128 bytes.");
 
 // bool compare_512bit_strings(const char* str1, const char* str2) {
 //     __m512i v1 = _mm512_loadu_si512((const void*)str1);
@@ -571,7 +436,7 @@ int main(int argc, char** argv) {
     // exit(0);
 
     // Main processing function for each thread.
-    auto process_chunk = [&](lock_free_buffer& buf, TheMap &result, int i) {
+    auto process_chunk = [&](data_buffer& buf, TheMap &result, int i) {
         size_t pos=0;
         // +6 because we read the number past the semicolon.
         char* it = buf.get_pointer_at(pos, VecSize + 6);
@@ -585,7 +450,8 @@ int main(int argc, char** argv) {
             // Prefetch data to be accessed in the future (DOESN'T HELP).
             // _mm_prefetch(it + VecSize, _MM_HINT_T0);
 
-            // Load aligned bytes into simd register.
+            // Load unaligned bytes into simd register.
+            // if (i==63 && it + VecSize > end) break;
             VecType data = VEC_LOADU_SI(reinterpret_cast<const VecType*>(it));
             // DEBUG PRINT DATA
             // alignas(VecSize) char buffer[VecSize];
@@ -639,27 +505,28 @@ int main(int argc, char** argv) {
             // it = buf.get_pointer_at(pos, VecSize + 6);
 
             constexpr size_t UNMAP_SIZE = 1024*1024*10;
-            if (nay((pos % (UNMAP_SIZE)) == 0)) {
+            if (nay(pos > 128 && ((pos-128) % (UNMAP_SIZE)) == 0)) {
+              // if (buf.get_pointer_at(pos-4096, 0) > line_start) exit(1);
               // Leave 1 page to back ref line_start.
-              buf.unmap(pos-4096);
+              buf.unmap(UNMAP_SIZE);
             }
         }
         counter += inner_counter;
 
-        // info("Thread ", i, " spins: ", buf.get_spins());
+        // info("Thread ", i, " complete");
     };
 
     std::cout << "Setup: " << t0.milliseconds() << std::endl;
 
     // Launch threads
-    std::vector<std::unique_ptr<lock_free_buffer>> bufs(num_cpus);
+    std::vector<std::unique_ptr<data_buffer>> bufs(num_cpus);
     std::vector<std::thread> threads;
     std::vector<TheMap> thread_results(num_cpus);
     auto t1 = Timer();
     for (unsigned i = 0; i < num_cpus; ++i) {
         auto logic_cpu = i;
         auto start_offset = file_positions[i];
-        auto lfb = std::make_unique<lock_free_buffer>(filename, start_offset, file_positions[i+1] - start_offset, logic_cpu);
+        auto lfb = std::make_unique<data_buffer>(filename, start_offset, file_positions[i+1] - start_offset, logic_cpu);
         bufs[i] = std::move(lfb); // To free later.
 
         // info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
@@ -724,8 +591,10 @@ int main(int argc, char** argv) {
 
     // Cleanup
     auto t4 = Timer();
-    bufs.clear();
-    thread_results.clear();
+    // keys.clear();
+    // combined.clear();
+    // bufs.clear();
+    // thread_results.clear();
     // munmap(map, sb.st_size);
     // close(fd);
     auto t4r = t4.milliseconds();
