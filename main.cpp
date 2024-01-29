@@ -145,11 +145,10 @@ public:
         size_t offset_difference = start_offset - aligned_offset;
         size_t adjusted_length = length + offset_difference;
         adjusted_length += page_size - (adjusted_length % page_size);
-        _mapped_start = static_cast<char*>(mmap(nullptr, adjusted_length, PROT_READ, MAP_PRIVATE, fd, aligned_offset));
-        if (_aligned_start == MAP_FAILED) {
-            std::cerr << "Error mapping file: " << strerror(errno) << std::endl;
-            _start = nullptr;
-            close(fd);
+        size_t address = 0x7f0000000000ULL + 1024ULL*1024*300*i;
+        _mapped_start = static_cast<char*>(mmap((void*)address, adjusted_length, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, aligned_offset));
+        if (_mapped_start == MAP_FAILED || _mapped_start != (char*)address) {
+            info("Error mapping file: ", strerror(errno), " requested: ", std::hex, (uintptr_t)address, " actual: ", (uintptr_t)_mapped_start);
             exit(1);
         }
         _aligned_start = _mapped_start;
@@ -159,6 +158,19 @@ public:
 
         // Close the file as it is no longer needed
         close(fd);
+
+        // Map in a zero page.
+        int zero_fd = open("/dev/zero", O_RDWR);
+        if (zero_fd == -1) {
+            info("Error opening /dev/zero");
+            exit(1);
+        }
+        char* padding = static_cast<char*>(mmap(_aligned_end, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, zero_fd, 0));
+        if (padding == MAP_FAILED || padding != _aligned_end) {
+            info("Error mapping /dev/zero: ", strerror(errno), " requested: ", std::hex, (uintptr_t)_aligned_end, " actual: ", (uintptr_t)padding);
+            exit(1);
+        }
+        close(zero_fd);
 
         info(i, " file buf range: 0x",
             std::hex,
@@ -175,10 +187,10 @@ public:
         // info("dd if=", filename, " bs=1 skip=", aligned_offset, " count=", length+offset_difference, " | hexdump -C | less");
 
         // Remove mem protection on one page past the end of the mapping for overreads.
-        if (mprotect(_aligned_end, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-            info("Error changing page protection: ", strerror(errno), " ", std::hex, (uintptr_t)_aligned_end);
-            // exit(1);
-        }
+        // if (mprotect(_aligned_end, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
+        //     info("Error changing page protection: ", strerror(errno), " ", std::hex, (uintptr_t)_aligned_end);
+        //     // exit(1);
+        // }
     }
 
     ~data_buffer() {
@@ -189,14 +201,16 @@ public:
         return _start + index;
     }
 
-    void unmap(size_t len_to_unmap) {
+    void unmap(size_t pos) {
         Timer t;
-        auto r = munmap(_mapped_start, len_to_unmap);
-        // auto r = munmap(_aligned_start, (_mapped_start - _aligned_start) + len_to_unmap);
-        // info(std::dec, _i, " unmapped: ", r, " ", std::hex, 
+        auto r = munmap(_mapped_start, pos);
+
+        // auto len = pos - (_mapped_start - _aligned_start);
+        // auto r = munmap(_mapped_start, len);
+        // info(std::dec, _i, " pos: ", pos, " unmapped: ", r, " ", std::hex, 
         //     (uintptr_t)_mapped_start, "-",
-        //     (uintptr_t)_mapped_start + len_to_unmap, std::dec, " ", t.milliseconds());
-        _mapped_start += len_to_unmap;
+        //     (uintptr_t)_mapped_start + pos, std::dec, " ", t.milliseconds());
+        // _mapped_start += len;
     }
 
     char* end() {
@@ -285,13 +299,6 @@ struct alignas(64) MinMaxAvg {
 
 static_assert(sizeof(MinMaxAvg) == 128, "MinMaxAvg not 128 bytes.");
 
-// bool compare_512bit_strings(const char* str1, const char* str2) {
-//     __m512i v1 = _mm512_loadu_si512((const void*)str1);
-//     __m512i v2 = _mm512_loadu_si512((const void*)str2);
-//     __mmask64 result = _mm512_cmpeq_epi8_mask(v1, v2);
-//     return result == 0xFFFFFFFFFFFFFFFF;
-// }
-
 // 16384 entries times 128 bytes is 2MB.
 // L2 cache is 2mb per core so it should fit.
 constexpr size_t HashMapSize = 1024 * 16;
@@ -327,57 +334,7 @@ inline uint32_t hash_name(std::string_view const& name) {
     return key;
 }
 
-int main(int argc, char** argv) {
-    auto t0 = Timer();
-    std::vector<std::string> args(argv, argv + argc);
-    std::string filename = args.size() > 1 ?  args[1] : "measurements.txt";
-
-    // Determine the number of CPUs
-    char* threads_str = std::getenv("THREADS");
-    unsigned num_cpus = threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
-
-    // Calculate start/end positions for each thread.
-    std::vector<size_t> file_positions(num_cpus+1, 0);
-    {
-      // Open the file
-      int fd = open(filename.c_str(), O_RDONLY);
-      if (fd == -1) {
-          std::cerr << "Error opening file" << std::endl;
-          return 1;
-      }
-
-      // Get file size
-      struct stat sb;
-      if (fstat(fd, &sb) == -1) {
-          std::cerr << "Error getting file size" << std::endl;
-          close(fd);
-          return 1;
-      }
-
-      // Memory map the file.
-      char *map = static_cast<char*>(mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
-      if (map == MAP_FAILED) {
-          std::cerr << "Error mapping file" << std::endl;
-          close(fd);
-          return 1;
-      }
-      madvise(map, sb.st_size, MADV_RANDOM);
-
-      size_t chunk_size = sb.st_size / num_cpus;
-      for (unsigned i = 1; i < num_cpus; ++i) {
-          size_t pos = i * chunk_size;
-          while (map[pos-1] != '\n') ++pos;
-          file_positions[i] = pos;
-      }
-      file_positions[num_cpus] = sb.st_size;
-
-      munmap(map, sb.st_size);
-    }
-    // DEBUG START/END POSITIONS.
-    // for (auto f : file_positions) {
-    //   std::cout << f << std::endl;
-    // }
-
+void init_tables() {
     // Compute number lookup table.
     for (int num = 0; num <= 99; ++num) {
         for (int decimal = 0; decimal <= 9; ++decimal) {
@@ -423,6 +380,62 @@ int main(int argc, char** argv) {
     //   std::cout << std::setw(16) << std::setfill('0') << std::hex << hash_masks2[i] <<
     //     std::setw(16) << std::setfill('0') << std::hex << hash_masks[i] << std::endl;
     // }
+}
+
+int main(int argc, char** argv) {
+    auto t0 = Timer();
+    std::vector<std::string> args(argv, argv + argc);
+    std::string filename = args.size() > 1 ?  args[1] : "measurements.txt";
+
+    // Determine the number of CPUs
+    char* threads_str = std::getenv("THREADS");
+    unsigned num_cpus = 64;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
+
+    size_t page_size = sysconf(_SC_PAGE_SIZE);
+
+    // Calculate start/end positions for each thread.
+    std::vector<size_t> file_positions(num_cpus+1, 0);
+    {
+      // Open the file
+      int fd = open(filename.c_str(), O_RDONLY);
+      if (fd == -1) {
+          std::cerr << "Error opening file" << std::endl;
+          return 1;
+      }
+
+      // Get file size
+      struct stat sb;
+      if (fstat(fd, &sb) == -1) {
+          std::cerr << "Error getting file size" << std::endl;
+          close(fd);
+          return 1;
+      }
+
+      // Memory map the file.
+      char *map = static_cast<char*>(mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
+      if (map == MAP_FAILED) {
+          std::cerr << "Error mapping file" << std::endl;
+          close(fd);
+          return 1;
+      }
+      madvise(map, sb.st_size, MADV_RANDOM);
+
+      size_t chunk_size = sb.st_size / num_cpus;
+      for (unsigned i = 1; i < num_cpus; ++i) {
+          size_t pos = i * chunk_size;
+          while (map[pos-1] != '\n') ++pos;
+          file_positions[i] = pos;
+      }
+      file_positions[num_cpus] = sb.st_size;
+
+      munmap(map, sb.st_size);
+    }
+    // DEBUG START/END POSITIONS.
+    // for (auto f : file_positions) {
+    //   std::cout << f << std::endl;
+    // }
+
+    init_tables();
 
     std::atomic<int> counter(0);
 
@@ -447,11 +460,7 @@ int main(int argc, char** argv) {
         char* line_start = it;
 
         while (yay(it < end)) {
-            // Prefetch data to be accessed in the future (DOESN'T HELP).
-            // _mm_prefetch(it + VecSize, _MM_HINT_T0);
-
             // Load unaligned bytes into simd register.
-            // if (i==63 && it + VecSize > end) break;
             VecType data = VEC_LOADU_SI(reinterpret_cast<const VecType*>(it));
             // DEBUG PRINT DATA
             // alignas(VecSize) char buffer[VecSize];
@@ -504,11 +513,11 @@ int main(int argc, char** argv) {
             it += VecSize;
             // it = buf.get_pointer_at(pos, VecSize + 6);
 
-            constexpr size_t UNMAP_SIZE = 1024*1024*10;
-            if (nay(pos > 128 && ((pos-128) % (UNMAP_SIZE)) == 0)) {
-              // if (buf.get_pointer_at(pos-4096, 0) > line_start) exit(1);
-              // Leave 1 page to back ref line_start.
-              buf.unmap(UNMAP_SIZE);
+            const size_t UNMAP_SIZE = 1024*1024*100;
+            // Leave 1 page to back ref line_start.
+            const size_t TRAIL = page_size;
+            if (nay(pos > TRAIL && ((pos-TRAIL) % (UNMAP_SIZE)) == 0)) {
+              buf.unmap(pos-TRAIL);
             }
         }
         counter += inner_counter;
@@ -516,26 +525,27 @@ int main(int argc, char** argv) {
         // info("Thread ", i, " complete");
     };
 
-    std::cout << "Setup: " << t0.milliseconds() << std::endl;
-
     // Launch threads
     std::vector<std::unique_ptr<data_buffer>> bufs(num_cpus);
     std::vector<std::thread> threads;
     std::vector<TheMap> thread_results(num_cpus);
     auto t1 = Timer();
     for (unsigned i = 0; i < num_cpus; ++i) {
-        auto logic_cpu = i;
         auto start_offset = file_positions[i];
-        auto lfb = std::make_unique<data_buffer>(filename, start_offset, file_positions[i+1] - start_offset, logic_cpu);
+        auto lfb = std::make_unique<data_buffer>(filename, start_offset, file_positions[i+1] - start_offset, i);
         bufs[i] = std::move(lfb); // To free later.
+    }
 
+    std::cout << "Setup: " << t0.milliseconds() << std::endl;
+
+    for (unsigned i = 0; i < num_cpus; ++i) {
         // info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
         threads.emplace_back([=, &thread_results, &bufs] {
 #if defined(__x86_64__)
           // Set thread affinity to CPU core 'i'.
           cpu_set_t cpuset;
           CPU_ZERO(&cpuset);
-          CPU_SET(logic_cpu, &cpuset);
+          CPU_SET(i, &cpuset);
 
           int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
           if (rc != 0) {
@@ -591,10 +601,10 @@ int main(int argc, char** argv) {
 
     // Cleanup
     auto t4 = Timer();
-    // keys.clear();
-    // combined.clear();
-    // bufs.clear();
-    // thread_results.clear();
+    keys.clear();
+    combined.clear();
+    thread_results.clear();
+    bufs.clear();
     // munmap(map, sb.st_size);
     // close(fd);
     auto t4r = t4.milliseconds();
