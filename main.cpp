@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <array>
 #include <iomanip>
@@ -130,7 +131,6 @@ class data_buffer {
 public:
     data_buffer(const std::string& filename, size_t start_offset, size_t length, int i)
         : _i(i)
-        , _total_to_read(length)
     {
         // Open file
         int fd = open(filename.c_str(), O_RDONLY);
@@ -172,18 +172,15 @@ public:
         }
         close(zero_fd);
 
-        info(i, " file buf range: 0x",
-            std::hex,
-            (uintptr_t)_aligned_start, "-0x",
-            (uintptr_t)_start, "-0x",
-            (uintptr_t)_end, "-0x",
-            (uintptr_t)(_aligned_end),
-            std::dec,
-            " offset: ", std::setw(8), start_offset,
-            " length: ", std::setw(8), length);
-            // " padding: ", std::setw(2), rounded_size - length,
-            // " alloc_size: ", rounded_size,
-            // " simd_blocks: ", rounded_size / VecSize);
+        // info(i, " file buf range: 0x",
+        //     std::hex,
+        //     (uintptr_t)_aligned_start, "-0x",
+        //     (uintptr_t)_start, "-0x",
+        //     (uintptr_t)_end, "-0x",
+        //     (uintptr_t)(_aligned_end),
+        //     std::dec,
+        //     " offset: ", std::setw(8), start_offset,
+        //     " length: ", std::setw(8), length);
         // info("dd if=", filename, " bs=1 skip=", aligned_offset, " count=", length+offset_difference, " | hexdump -C | less");
 
         // Remove mem protection on one page past the end of the mapping for overreads.
@@ -213,19 +210,21 @@ public:
         // _mapped_start += len;
     }
 
+    char* begin() {
+        return _start;
+    }
+
     char* end() {
         return _end;
     }
 
 private:
     int _i;
-    std::atomic_size_t _processed_length;
     char* _mapped_start;
     char* _aligned_start;
     char* _start;
     char* _end;
     char* _aligned_end;
-    size_t _total_to_read;
 };
 
 // A big 'ol number lookup table.
@@ -304,7 +303,8 @@ static_assert(sizeof(MinMaxAvg) == 128, "MinMaxAvg not 128 bytes.");
 constexpr size_t HashMapSize = 1024 * 16;
 using MapIndex = uint64_t;
 using TheMap = std::array<MinMaxAvg, HashMapSize>;
-inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
+static_assert(sizeof(TheMap) == 1024 * 16 * 128, "TheMap bad size.");
+inline MinMaxAvg& lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
     // While we have bucket collison, linear probe forward while there is name that doesn't match.
@@ -314,7 +314,7 @@ inline MinMaxAvg* lookup(TheMap& map, MapIndex key, std::string_view const& key_
       lookup_key = (lookup_key + 1) % HashMapSize;
       entry = &map[lookup_key];
     }
-    return entry;
+    return *entry;
 }
 
 inline uint32_t hash_name(std::string_view const& name) {
@@ -439,20 +439,14 @@ int main(int argc, char** argv) {
 
     std::atomic<int> counter(0);
 
-    // 16384 entries times 32 bytes and entry is 524288 bytes.
-    constexpr size_t HashMapSize = 1024 * 16;
-    TheMap hash_map;
-    using MapIndex = uint64_t;
-    using TheMap = decltype(hash_map);
     // DEBUG SIZE OF HASHMAP
     // std::cout << sizeof(MinMaxAvg) << std::endl;
     // exit(0);
 
     // Main processing function for each thread.
     auto process_chunk = [&](data_buffer& buf, TheMap &result, int i) {
-        size_t pos=0;
-        // +6 because we read the number past the semicolon.
-        char* it = buf.get_pointer_at(pos, VecSize + 6);
+        // size_t pos=0;
+        char* it = buf.begin();
         char* end = buf.end();
         int inner_counter = 0;
 
@@ -487,6 +481,7 @@ int main(int argc, char** argv) {
               std::string_view key_str(line_start, sc_pos - line_start);
               // Compute key for name.
               uint64_t key = hash_name(key_str);
+              auto& entry = lookup(result, key, key_str);
 
               // Extract value.
               char* v_pos = sc_pos + 1;
@@ -500,7 +495,7 @@ int main(int argc, char** argv) {
               // std::cout << "len: " << key_str.size()  << " n: " << key_str << " k: " << key << " v: " << value << std::endl;
 
               // Locate entry in hashmap and update.
-              lookup(result, key, key_str)->update(key_str, key, value);
+              entry.update(key_str, key, value);
 
               // Remove this semicolon from the semicolon mask and loop back around.
               sc_mask &= ~(1ULL << sc_index);
@@ -509,16 +504,15 @@ int main(int argc, char** argv) {
               // if (inner_counter > 1000) exit(0);
             }
 
-            pos += VecSize;
             it += VecSize;
-            // it = buf.get_pointer_at(pos, VecSize + 6);
 
-            const size_t UNMAP_SIZE = 1024*1024*100;
-            // Leave 1 page to back ref line_start.
-            const size_t TRAIL = page_size;
-            if (nay(pos > TRAIL && ((pos-TRAIL) % (UNMAP_SIZE)) == 0)) {
-              buf.unmap(pos-TRAIL);
-            }
+            // pos += VecSize;
+            // const size_t UNMAP_SIZE = 1024*1024*100;
+            // // Leave 1 page to back ref line_start.
+            // const size_t TRAIL = page_size;
+            // if (nay(pos > TRAIL && ((pos-TRAIL) % (UNMAP_SIZE)) == 0)) {
+            //   buf.unmap(pos-TRAIL);
+            // }
         }
         counter += inner_counter;
 
@@ -528,12 +522,22 @@ int main(int argc, char** argv) {
     // Launch threads
     std::vector<std::unique_ptr<data_buffer>> bufs(num_cpus);
     std::vector<std::thread> threads;
+    info(t0.milliseconds());
+    // TheMap* thread_results;
+    // (TheMap*)posix_memalign((void**)&thread_results, 128, sizeof(TheMap) * num_cpus);
+    // TheMap* thread_results = (TheMap*)aligned_alloc(128, sizeof(TheMap) * num_cpus);
+    // TheMap* thread_results = (TheMap*)malloc(sizeof(TheMap) * num_cpus);
+    // TheMap* thread_results = new TheMap[num_cpus];
+    info(t0.milliseconds());
+    // memset(thread_results, 0, sizeof(TheMap) * num_cpus);
     std::vector<TheMap> thread_results(num_cpus);
+    info(t0.milliseconds());
+    // info(std::hex, (uintptr_t)thread_results.data());
     auto t1 = Timer();
     for (unsigned i = 0; i < num_cpus; ++i) {
         auto start_offset = file_positions[i];
         auto lfb = std::make_unique<data_buffer>(filename, start_offset, file_positions[i+1] - start_offset, i);
-        bufs[i] = std::move(lfb); // To free later.
+        bufs[i] = std::move(lfb);
     }
 
     std::cout << "Setup: " << t0.milliseconds() << std::endl;
@@ -568,7 +572,8 @@ int main(int argc, char** argv) {
     auto t2 = Timer();
     std::unordered_map<std::string_view, MinMaxAvg> combined;
     combined.reserve(HashMapSize);
-    for (auto &thread_result : thread_results) {
+    for (int i=0; i<num_cpus; ++i) {
+      auto& thread_result = thread_results[i];
         for (auto &kv : thread_result) {
           if (!kv.name[0]) continue;
           auto& cr = combined[kv.name];
@@ -603,6 +608,8 @@ int main(int argc, char** argv) {
     auto t4 = Timer();
     keys.clear();
     combined.clear();
+    // delete[] thread_results;
+    // free(thread_results);
     thread_results.clear();
     bufs.clear();
     // munmap(map, sb.st_size);
