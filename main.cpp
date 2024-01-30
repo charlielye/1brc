@@ -31,6 +31,8 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 
+// #define DEBUG
+
 // #undef __x86_64__
 // #undef __aarch64__
 // #define __aarch64__
@@ -125,18 +127,28 @@ private:
 };
 
 // It's a logger.
-template <typename... Args> void info(Args... args)
+template <typename... Args> void info(Args const&... args)
 {
     std::ios_base::fmtflags f(std::cout.flags());
     ((std::cout << args), ...) << std::endl;
     std::cout.flags(f);
 }
 
+#ifdef DEBUG
+template <typename... Args> void debug(Args const&... args)
+{
+    info(args...);
+}
+#else
+//template <typename... Args> void debug(Args const&... args){}
+#define debug(...)
+#endif
+
 class ThreadPool {
 public:
-    ThreadPool(size_t num_threads) : stopping(false), active_tasks(0) {
+    ThreadPool(size_t num_threads, int pin_offset = 0) {
         for (size_t i = 0; i < num_threads; ++i) {
-            threads.emplace_back([this] { this->worker_thread(); });
+            threads.emplace_back([=] { this->worker_thread(pin_offset + i); });
         }
     }
 
@@ -146,12 +158,12 @@ public:
             stopping = true;
         }
         condition.notify_all();
-        for (std::thread &thread : threads) {
+        for (auto &thread : threads) {
             thread.join();
         }
     }
 
-    void enqueue(std::function<void()> task) {
+    void enqueue(std::function<void(int)> task) {
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             tasks.push(std::move(task));
@@ -159,22 +171,27 @@ public:
         condition.notify_one();
     }
 
-    void flush() {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        condition.wait(lock, [this] { return tasks.empty() && active_tasks == 0; });
-    }
-
 private:
     std::vector<std::thread> threads;
-    std::queue<std::function<void()>> tasks;
+    std::queue<std::function<void(int)>> tasks;
     std::mutex queue_mutex;
     std::condition_variable condition;
-    bool stopping;
-    int active_tasks;
+    bool stopping = false;
 
-    void worker_thread() {
+    void worker_thread(int i) {
+#if defined(__x86_64__)
+        // Set thread affinity to CPU core 'i'.
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(i, &cpuset);
+
+        int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        if (rc != 0) {
+            info("Error setting thread affinity: ", i, strerror(rc));
+        }
+#endif
         while (true) {
-            std::function<void()> task;
+            std::function<void(int)> task;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex);
                 condition.wait(lock, [this] { return stopping || !tasks.empty(); });
@@ -183,123 +200,39 @@ private:
                 }
                 task = std::move(tasks.front());
                 tasks.pop();
-                ++active_tasks;
             }
-            task();
-            {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                --active_tasks;
-                if (tasks.empty() && active_tasks == 0) {
-                    condition.notify_all();
-                }
-            }
+            task(i);
         }
     }
 };
 
-class data_buffer {
+class TaskManager {
 public:
-    data_buffer(const std::string& filename, size_t start_offset, size_t length, int i)
-        : _i(i)
-    {
-        // Open file
-        int fd = open(filename.c_str(), O_RDONLY);
-        if (fd == -1) {
-            std::cerr << "Error opening file" << std::endl;
-            return;
-        }
+    TaskManager(ThreadPool& pool) : pool(pool), active_tasks(0) {}
 
-        // Memory map the file
-        size_t page_size = sysconf(_SC_PAGE_SIZE);
-        size_t aligned_offset = start_offset - (start_offset % page_size);
-        size_t offset_difference = start_offset - aligned_offset;
-        size_t adjusted_length = length + offset_difference;
-        adjusted_length += page_size - (adjusted_length % page_size);
-        size_t address = 0;//0x7f0000000000ULL + 1024ULL*1024*300*i;
-        _mapped_start = static_cast<char*>(mmap((void*)address, adjusted_length, PROT_READ, MAP_PRIVATE, fd, aligned_offset));
-        if (_mapped_start == MAP_FAILED) {// || _mapped_start != (char*)address) {
-            info("Error mapping file: ", strerror(errno), " requested: ", std::hex, (uintptr_t)address, " actual: ", (uintptr_t)_mapped_start);
-            exit(1);
-        }
-        _aligned_start = _mapped_start;
-        _start = _aligned_start + offset_difference;
-        _end = _start + length;
-        _aligned_end = _aligned_start + adjusted_length;
-
-        // Close the file as it is no longer needed
-        close(fd);
-
-        // Map in zero pages.
-        int zero_fd = open("/dev/zero", O_RDWR);
-        if (zero_fd == -1) {
-            info("Error opening /dev/zero");
-            exit(1);
-        }
-        // char* start_padding = static_cast<char*>(mmap(_aligned_start-page_size, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, zero_fd, 0));
-        // if (start_padding == MAP_FAILED || start_padding != _aligned_start-page_size) {
-        //     info("Error mapping /dev/zero: ", strerror(errno));
-        //     exit(1);
-        // }
-        char* padding = static_cast<char*>(mmap(_aligned_end, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, zero_fd, 0));
-        if (padding == MAP_FAILED || padding != _aligned_end) {
-            info("Error mapping /dev/zero: ", strerror(errno), " requested: ", std::hex, (uintptr_t)_aligned_end, " actual: ", (uintptr_t)padding);
-            exit(1);
-        }
-        close(zero_fd);
-
-        info(i, " file buf range: 0x",
-            std::hex,
-            (uintptr_t)_aligned_start, "-0x",
-            (uintptr_t)_start, "-0x",
-            (uintptr_t)_end, "-0x",
-            (uintptr_t)(_aligned_end),
-            std::dec,
-            " offset: ", std::setw(8), start_offset,
-            " length: ", std::setw(8), length);
-        // info("dd if=", filename, " bs=1 skip=", aligned_offset, " count=", length+offset_difference, " | hexdump -C | less");
-
-        // Remove mem protection on one page past the end of the mapping for overreads.
-        // if (mprotect(_aligned_end, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-        //     info("Error changing page protection: ", strerror(errno), " ", std::hex, (uintptr_t)_aligned_end);
-        //     // exit(1);
-        // }
+    void enqueue(std::function<void(int)> task) {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        ++active_tasks;
+        pool.enqueue([this, task] (int i) {
+            task(i);
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            --active_tasks;
+            if (active_tasks == 0) {
+                condition.notify_all();
+            }
+        });
     }
 
-    ~data_buffer() {
-      munmap(_mapped_start, _aligned_end - _mapped_start);
-    }
-
-    char* get_pointer_at(size_t index, size_t len) {
-        return _start + index;
-    }
-
-    void unmap(size_t pos) {
-        Timer t;
-        auto r = munmap(_mapped_start, pos);
-
-        // auto len = pos - (_mapped_start - _aligned_start);
-        // auto r = munmap(_mapped_start, len);
-        // info(std::dec, _i, " pos: ", pos, " unmapped: ", r, " ", std::hex, 
-        //     (uintptr_t)_mapped_start, "-",
-        //     (uintptr_t)_mapped_start + pos, std::dec, " ", t.milliseconds());
-        // _mapped_start += len;
-    }
-
-    char* begin() {
-        return _start;
-    }
-
-    char* end() {
-        return _end;
+    void flush() {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        condition.wait(lock, [this] { return active_tasks == 0; });
     }
 
 private:
-    int _i;
-    char* _mapped_start;
-    char* _aligned_start;
-    char* _start;
-    char* _end;
-    char* _aligned_end;
+    ThreadPool& pool;
+    std::atomic<int> active_tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
 };
 
 // A big 'ol number lookup table.
@@ -351,7 +284,7 @@ struct alignas(64) MinMaxAvg {
     inline void update(std::string_view const& key_str, int _key, int16_t value) {
       // TODO: simd copy
         if (nay(name[0] == 0)) memcpy(name, key_str.data(), key_str.length());
-        // info(name);
+        // debug(name);
         min = std::min(min, value);
         max = std::max(max, value);
         sum += value;
@@ -464,11 +397,12 @@ int main(int argc, char** argv) {
 
     // Determine the number of CPUs
     char* threads_str = std::getenv("THREADS");
-    unsigned num_cpus = 64;//threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
+    unsigned num_cpus = threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
+
+    char* chunks_str = std::getenv("CHUNKS");
+    unsigned MAP_CHUNKS = chunks_str != nullptr ? std::atoi(chunks_str) : 8;
 
     size_t page_size = sysconf(_SC_PAGE_SIZE);
-
-    int MAP_CHUNKS=8;
 
     // Open the file
     int fd = open(filename.c_str(), O_RDONLY);
@@ -514,11 +448,9 @@ int main(int argc, char** argv) {
     init_tables();
 
     std::atomic<int> counter(0);
-    // +1 For unmapping thread that just blocks waiting on kernel.
-    ThreadPool pool(num_cpus+MAP_CHUNKS);
 
     // Main processing function for each thread.
-    auto process_chunk = [&](char* it, char* end, TheMap &result, int i) {
+    auto process_chunk = [&](char* it, char* end, TheMap &result, int i, int c) {
       Timer t;
         // size_t pos=0;
         // char* it = buf.begin();
@@ -543,7 +475,7 @@ int main(int argc, char** argv) {
             MaskType sc_mask = VEC_CMPEQ_EPI8_MASK(data, semicolon);
             // std::bitset<VecSize> bs(sc_mask);
             // auto bs_str = bs.to_string();
-            // info(std::string(bs_str.rbegin(),  bs_str.rend()));
+            // debug(std::string(bs_str.rbegin(),  bs_str.rend()));
 
             // Loop once for each found semicolon.
             while (yay(sc_mask)) {
@@ -591,72 +523,65 @@ int main(int argc, char** argv) {
         }
         counter += inner_counter;
 
-        // info("Thread ", i, " complete ", t.milliseconds());
+        debug(c, " thread ", i, " complete ", t.milliseconds());
     };
 
     info(t0.milliseconds());
     std::vector<TheMap> thread_results(num_cpus);
-    info(t0.milliseconds());
-    std::vector<std::thread> unmap_threads(MAP_CHUNKS);
+    info("alloc thread results ", t0.milliseconds());
+
+    std::unordered_map<std::string_view, MinMaxAvg> combined;
+    combined.reserve(HashMapSize);
+    info("alloc combined ", t0.milliseconds());
+
+    ThreadPool pool(num_cpus);
+    std::vector<std::unique_ptr<TaskManager>> chunk_tasks;
+
+    ThreadPool unmap_pool(1, num_cpus);
+    TaskManager unmap_tasks(unmap_pool);
+
+    // std::vector<std::thread> unmap_threads(MAP_CHUNKS);
       // std::cout << "Setup: " << t0.milliseconds() << std::endl;
     auto t1 = Timer();
 
     for (int c=0; c<MAP_CHUNKS; ++c) {
       Timer t;
-      // info("Chunk ", c, " starting");
-      // Launch threads
-      // std::vector<std::unique_ptr<data_buffer>> bufs(num_cpus);
-      // std::vector<std::thread> threads;
 
+      auto& tasks = *chunk_tasks.emplace_back(std::make_unique<TaskManager>(pool));
       for (unsigned i = 0; i < num_cpus; ++i) {
           auto start_offset = file_positions[c*num_cpus+i];
           auto end_offset = file_positions[c*num_cpus+i+1];
-          // info("chunk: ", c, " thread: ", i, " so: ", start_offset, " eo: ", end_offset);
+          // debug("chunk: ", c, " thread: ", i, " so: ", start_offset, " eo: ", end_offset);
 
-          // info("Pinning to cpus, logic: ", logic_cpu, " data: ", data_cpu);
-          pool.enqueue([=, &thread_results] {
-#if defined(__x86_64__)
-            // Set thread affinity to CPU core 'i'.
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(i, &cpuset);
-
-            int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-            if (rc != 0) {
-                std::cerr << "Error setting thread affinity: " << rc << std::endl;
-            }
-#endif
-            // Call the processing function.
-            process_chunk(map + start_offset, map + end_offset, std::ref(thread_results[i]), i);
+          tasks.enqueue([=, &thread_results] (int worker_thread) {
+            process_chunk(map + start_offset, map + end_offset, std::ref(thread_results[worker_thread]), i, c);
         });
       }
-      // info(c, " enqueue: ", t.milliseconds());
-      // Join threads
-      pool.flush();
-      // info(c, " flush: ", t.milliseconds());
+
+      // tasks.flush();
 
       // Unmap in background.
-      auto start_unmap = file_positions[c*num_cpus];
-      auto end_unmap = file_positions[(c*num_cpus)+num_cpus];
-      start_unmap -= (start_unmap % page_size);
-      // size_t aligned_end = end_unmap - (end_unmap % page_size) - page_size;
-      Timer t1;
-      pool.enqueue([=] {
-          Timer t;
-        info(c, " unmapping: ", start_unmap, " ", end_unmap - page_size);
-        auto r = munmap(map + start_unmap, end_unmap - page_size - start_unmap);
-        info(c, " unmap done ", r, " ", t.milliseconds());
+      unmap_tasks.enqueue([=, &file_positions, &tasks] (int) {
+        auto start_unmap = file_positions[c*num_cpus];
+        auto end_unmap = file_positions[(c*num_cpus)+num_cpus] - page_size;
+        start_unmap -= (start_unmap % page_size);
+        debug(c, " unmapper waiting for tasks to complete");
+        tasks.flush();
+        Timer t;
+        debug(c, " unmapping: ", start_unmap, " ", end_unmap);
+        auto r = munmap(map + start_unmap, end_unmap - start_unmap);
+        debug(c, " unmap done ", r, " ", t.milliseconds());
       });
-      //
-      info(c, " enqueue unmap: ", t1.milliseconds());
+    }
+    // Wait for processing of all chunks to complete.
+    for (auto& tasks : chunk_tasks) {
+      tasks->flush();
     }
     auto t1r = t1.milliseconds();
 
     // Combine results.
     // WARNING: Loops over the entire table, assumes it isn't too huge.
     auto t2 = Timer();
-    std::unordered_map<std::string_view, MinMaxAvg> combined;
-    combined.reserve(HashMapSize);
     for (int i=0; i<num_cpus; ++i) {
       auto& thread_result = thread_results[i];
         for (auto &kv : thread_result) {
@@ -689,12 +614,11 @@ int main(int argc, char** argv) {
     outFile.close();
     auto t3r = t3.milliseconds();
 
+    debug("waiting unmap completion...");
     Timer t3_1;
-    pool.flush();
-    // for (auto &t : unmap_threads) {
-    //     t.join();
-    // }
+    unmap_tasks.flush();
     auto t3_1r = t3_1.milliseconds();
+    debug("unmap completion done... ", t3_1r);
 
     // Cleanup
     auto t4 = Timer();
@@ -704,14 +628,15 @@ int main(int argc, char** argv) {
     auto t4r = t4.milliseconds();
     auto total = t0.milliseconds();
 
-    std::cout << "  Threads: " << num_cpus << std::endl;
-    std::cout << " Parallel: " << t1r << std::endl;
-    std::cout << "Combining: " << t2r << std::endl;
-    std::cout << "  Writing: " << t3r << std::endl;
-    std::cout << "    Unmap: " << t3_1r << std::endl;
-    std::cout << "    Clean: " << t4r << std::endl;
-    std::cout << "    Total: " << total << std::endl;
-    std::cout << "Processed: " << counter << std::endl;
+    info("   Chunks: ", MAP_CHUNKS);
+    info("  Threads: ", num_cpus);
+    info(" Parallel: ", t1r);
+    info("Combining: ", t2r);
+    info("  Writing: ", t3r);
+    info("    Unmap: ", t3_1r);
+    info("    Clean: ", t4r);
+    info("    Total: ", total);
+    info("Processed: ", counter);
 
     return 0;
 }
