@@ -3,22 +3,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <array>
+#include <map>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
-// #include <memory>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
 #include <vector>
 #include <atomic>
-#include <unordered_map>
 #include <algorithm>
 #include <string>
 #include <fcntl.h>
-// #include <limits>
-// #include <bitset>
 #include <queue>
 #include <thread>
 #include <mutex>
@@ -140,10 +137,10 @@ template <typename... Args> void debug(Args const&... args)
     info(args...);
 }
 #else
-//template <typename... Args> void debug(Args const&... args){}
 #define debug(...)
 #endif
 
+// Simple worker thread pool.
 class ThreadPool {
 public:
     ThreadPool(size_t num_threads, int pin_offset = 0) {
@@ -206,6 +203,7 @@ private:
     }
 };
 
+// Schedules tasks on an underlying pool, provides "flush" ability to wait on tasks to be complete.
 class TaskManager {
 public:
     TaskManager(ThreadPool& pool) : pool(pool), active_tasks(0) {}
@@ -235,7 +233,7 @@ private:
     std::condition_variable condition;
 };
 
-// A big 'ol number lookup table.
+// A big 'ol number lookup table. 32k ensures no collisons.
 constexpr int NUM_LOOKUP_TABLE_SIZE = 1<<15;
 int num_lookup[NUM_LOOKUP_TABLE_SIZE];
 
@@ -252,39 +250,41 @@ inline int gen_num_key(const char* data, int newline_index) {
     return k % NUM_LOOKUP_TABLE_SIZE;
 }
 
+// For masking off unused bytes when string hashing.
 // Index by str len, hence we'll index from 1.
-uint64_t hash_masks[101];
+uint64_t hash_masks1[101];
 uint64_t hash_masks2[101];
 
-// TODO: flexible simd
+// Compare strings. Fast path assumes < 16 and just does uint64_t comparisons.
+// Target is guaranteed to be aligned. Source may suffer some kind of alignment penalty.
 bool compare_strings(const char* source, size_t source_len, const char* target) {
   if (nay(source_len > 16)) {
-    return memcmp(source, target, source_len) == 0;
+    return memcmp(source, target, source_len) == 0 && target[source_len] == 0;
   }
-  uint64_t s1 = ((uint64_t*)source)[0] & hash_masks[source_len];
+  uint64_t s1 = ((uint64_t*)source)[0] & hash_masks1[source_len];
   uint64_t s2 = ((uint64_t*)source)[1] & hash_masks2[source_len];
   uint64_t t1 = ((uint64_t*)target)[0];
   uint64_t t2 = ((uint64_t*)target)[1];
   return s1 == t1 && s2 == t2;
 }
 
-// L1d: 48k data per physical core.
 // Each cache line is 64 bytes wide.
 // Each entry will take a total of 2 cache lines (117/128 bytes).
+// L1d: 48k data per physical core. ~384 entries.
 struct alignas(64) MinMaxAvg {
     int16_t min;
     int16_t max;
     unsigned int count;
     int64_t sum;
-    alignas(8) char name[101] = {};
-    char padding[11];
+    alignas(8) char name[101];
 
-    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0) {}
+    MinMaxAvg() : min(std::numeric_limits<int16_t>::max()), max(std::numeric_limits<int16_t>::min()), sum(0), count(0), name("") {}
 
     inline void update(std::string_view const& key_str, int _key, int16_t value) {
-      // TODO: simd copy
-        if (nay(name[0] == 0)) memcpy(name, key_str.data(), key_str.length());
-        // debug(name);
+        if (nay(name[0] == 0)) {
+          memcpy(name, key_str.data(), key_str.length());
+          name[key_str.length()] = 0;
+        }
         min = std::min(min, value);
         max = std::max(max, value);
         sum += value;
@@ -309,15 +309,14 @@ static_assert(sizeof(MinMaxAvg) == 128, "MinMaxAvg not 128 bytes.");
 // 16384 entries times 128 bytes is 2MB.
 // L2 cache is 2mb per core so it should fit.
 constexpr size_t HashMapSize = 1024 * 16;
-using MapIndex = uint64_t;
 using TheMap = std::array<MinMaxAvg, HashMapSize>;
 static_assert(sizeof(TheMap) == 1024 * 16 * 128, "TheMap bad size.");
-inline MinMaxAvg& lookup(TheMap& map, MapIndex key, std::string_view const& key_str) {
+
+inline MinMaxAvg& lookup(TheMap& map, uint64_t key, std::string_view const& key_str) {
     auto lookup_key = key % HashMapSize;
     auto* entry = &map[lookup_key];
     // While we have bucket collison, linear probe forward while there is name that doesn't match.
     while (nay(entry->name[0] != 0 && !compare_strings(key_str.data(), key_str.length(), entry->name))) {
-    // while (nay(entry->key && entry->key != key)) {
       // std::cout << "lookup collision: " << key_str << " with " << entry->name << std::endl;
       lookup_key = (lookup_key + 1) % HashMapSize;
       entry = &map[lookup_key];
@@ -329,7 +328,7 @@ inline uint32_t hash_name(std::string_view const& name) {
     uint32_t key=0;
     auto len = name.size();
     auto data = ((uint64_t*)name.data());
-    auto key1 = data[0] & hash_masks[len];
+    auto key1 = data[0] & hash_masks1[len];
     auto key2 = data[1] & hash_masks2[len];
     key = CRC32_64(0, key1);
     key = CRC32_64(key, key2);
@@ -370,12 +369,12 @@ void init_tables() {
 
     // Index by str len, hence we'll index from 1.
     for (int i=1; i<=100; ++i) {
-      hash_masks[i] = ~0x0;
+      hash_masks1[i] = ~0x0;
       hash_masks2[i] = ~0x0;
     }
     for (int i=1; i<8; ++i) {
       // Discard tail bytes of first word.
-      hash_masks[i] = (1ULL << (i * 8)) - 1;
+      hash_masks1[i] = (1ULL << (i * 8)) - 1;
       // Discard all of second word.
       hash_masks2[i] = 0;
     }
@@ -395,23 +394,24 @@ int main(int argc, char** argv) {
     std::vector<std::string> args(argv, argv + argc);
     std::string filename = args.size() > 1 ?  args[1] : "measurements.txt";
 
-    // Determine the number of CPUs
+    // Determine the number of CPUs. Assume hyperthreading and / 2.
     char* threads_str = std::getenv("THREADS");
     unsigned num_cpus = threads_str != nullptr ? std::atoi(threads_str) : std::thread::hardware_concurrency() / 2;
 
+    // Linear chunks to allow piecmeal unmapping. Best value in testing was 8.
     char* chunks_str = std::getenv("CHUNKS");
-    unsigned MAP_CHUNKS = chunks_str != nullptr ? std::atoi(chunks_str) : 8;
+    unsigned map_chunks = chunks_str != nullptr ? std::atoi(chunks_str) : 8;
 
     size_t page_size = sysconf(_SC_PAGE_SIZE);
 
-    // Open the file
+    // Open the file.
     int fd = open(filename.c_str(), O_RDONLY);
     if (fd == -1) {
         std::cerr << "Error opening file" << std::endl;
         return 1;
     }
 
-    // Get file size
+    // Get file size.
     struct stat sb;
     if (fstat(fd, &sb) == -1) {
         std::cerr << "Error getting file size" << std::endl;
@@ -429,9 +429,8 @@ int main(int argc, char** argv) {
     close(fd);
 
     // Calculate start/end positions for each thread.
-    // madvise(map, sb.st_size, MADV_RANDOM);
-    std::vector<size_t> file_positions(num_cpus*MAP_CHUNKS+1, 0);
-    size_t num_chunks = num_cpus * MAP_CHUNKS;
+    std::vector<size_t> file_positions(num_cpus*map_chunks+1, 0);
+    size_t num_chunks = num_cpus * map_chunks;
     size_t chunk_size = sb.st_size / num_chunks;
     for (unsigned i = 1; i < num_chunks; ++i) {
         size_t pos = i * chunk_size;
@@ -439,7 +438,6 @@ int main(int argc, char** argv) {
         file_positions[i] = pos;
     }
     file_positions[num_chunks] = sb.st_size;
-
     // DEBUG START/END POSITIONS.
     // for (auto f : file_positions) {
     //   std::cout << f << std::endl;
@@ -526,28 +524,28 @@ int main(int argc, char** argv) {
         debug(c, " thread ", i, " complete ", t.milliseconds());
     };
 
-    info(t0.milliseconds());
-    std::vector<TheMap> thread_results(num_cpus);
-    info("alloc thread results ", t0.milliseconds());
-
-    std::unordered_map<std::string_view, MinMaxAvg> combined;
-    combined.reserve(HashMapSize);
-    info("alloc combined ", t0.milliseconds());
-
     ThreadPool pool(num_cpus);
     std::vector<std::unique_ptr<TaskManager>> chunk_tasks;
 
     ThreadPool unmap_pool(1, num_cpus);
     TaskManager unmap_tasks(unmap_pool);
 
-    // std::vector<std::thread> unmap_threads(MAP_CHUNKS);
-      // std::cout << "Setup: " << t0.milliseconds() << std::endl;
+    // Use all cpus to init hash table data.
+    TheMap* thread_results = (TheMap*)aligned_alloc(128, sizeof(TheMap)*num_cpus);
+    for (int i=0; i<num_cpus; ++i) {
+      pool.enqueue([=, &thread_results] (int) {
+        for (auto& e : thread_results[i]) {
+          e = MinMaxAvg();
+        }
+      });
+    }
+
+    auto t0r = t0.milliseconds();
+
     auto t1 = Timer();
-
-    for (int c=0; c<MAP_CHUNKS; ++c) {
-      Timer t;
-
+    for (int c=0; c<map_chunks; ++c) {
       auto& tasks = *chunk_tasks.emplace_back(std::make_unique<TaskManager>(pool));
+
       for (unsigned i = 0; i < num_cpus; ++i) {
           auto start_offset = file_positions[c*num_cpus+i];
           auto end_offset = file_positions[c*num_cpus+i+1];
@@ -557,8 +555,6 @@ int main(int argc, char** argv) {
             process_chunk(map + start_offset, map + end_offset, std::ref(thread_results[worker_thread]), i, c);
         });
       }
-
-      // tasks.flush();
 
       // Unmap in background.
       unmap_tasks.enqueue([=, &file_positions, &tasks] (int) {
@@ -580,63 +576,61 @@ int main(int argc, char** argv) {
     auto t1r = t1.milliseconds();
 
     // Combine results.
-    // WARNING: Loops over the entire table, assumes it isn't too huge.
     auto t2 = Timer();
-    for (int i=0; i<num_cpus; ++i) {
-      auto& thread_result = thread_results[i];
-        for (auto &kv : thread_result) {
-          if (!kv.name[0]) continue;
-          auto& cr = combined[kv.name];
-          if (kv.min < cr.min) cr.min = kv.min;
-          if (kv.max > cr.max) cr.max = kv.max;
-          cr.sum += kv.sum;
-          cr.count += kv.count;
-        }
+    for (int pivot = num_cpus / 2; pivot != 0; pivot /= 2) {
+      TaskManager combine_tasks(pool);
+      for (int i=0; i < pivot; ++i) {
+        combine_tasks.enqueue([=, &thread_results] (int) {
+          auto& target = thread_results[i];
+          auto& source = thread_results[pivot+i];
+          for (auto &e : source) {
+            if (!e.name[0]) continue;
+            auto& te = lookup(target, hash_name(e.name), e.name);
+            if (e.min < te.min) te.min = e.min;
+            if (e.max > te.max) te.max = e.max;
+            te.sum += e.sum;
+            te.count += e.count;
+          }
+        });
+      }
+      combine_tasks.flush();
+    }
+
+    std::map<std::string_view, MinMaxAvg*> results;
+    for (auto &e : thread_results[0]) {
+      if (!e.name[0]) continue;
+      results[e.name] = &e;
     }
     auto t2r = t2.milliseconds();
 
     // Write to file.
     auto t3 = Timer();
-    std::vector<std::string_view> keys;
-    for (const auto &kv : combined) {
-        keys.push_back(kv.first);
-    }
-    std::sort(keys.begin(), keys.end());
-
     std::ofstream outFile("output.txt");
     outFile << std::fixed << std::setprecision(1) << "{";
-    for (auto it = keys.begin(); it != keys.end(); ++it) {
-      const auto &mav = combined[*it];
-      outFile << *it << "=" << mav.Min() << "/" << mav.avg() << "/" << mav.Max();
-      if (nay(std::next(it) != keys.end())) outFile << ", ";
+    for (auto it = results.begin(); it != results.end(); ++it) {
+      const auto &mav = *it->second;
+      outFile << it->first << "=" << mav.Min() << "/" << mav.avg() << "/" << mav.Max();
+      if (nay(std::next(it) != results.end())) outFile << ", ";
     }
     outFile << "}\n";
     outFile.close();
     auto t3r = t3.milliseconds();
 
-    debug("waiting unmap completion...");
-    Timer t3_1;
-    unmap_tasks.flush();
-    auto t3_1r = t3_1.milliseconds();
-    debug("unmap completion done... ", t3_1r);
-
-    // Cleanup
-    auto t4 = Timer();
-    keys.clear();
-    combined.clear();
-    thread_results.clear();
-    auto t4r = t4.milliseconds();
     auto total = t0.milliseconds();
 
-    info("   Chunks: ", MAP_CHUNKS);
+    unmap_tasks.flush();
+    auto total_with_unmap = t0.milliseconds();
+
+    info("   Chunks: ", map_chunks);
     info("  Threads: ", num_cpus);
+    info("    Setup: ", t0r);
     info(" Parallel: ", t1r);
     info("Combining: ", t2r);
     info("  Writing: ", t3r);
-    info("    Unmap: ", t3_1r);
-    info("    Clean: ", t4r);
     info("    Total: ", total);
+    info("  w/Unmap: ", total_with_unmap);
     info("Processed: ", counter);
 
+    _exit(0);
     return 0;
 }
