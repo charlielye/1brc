@@ -35,7 +35,7 @@
 // #define __aarch64__
 
 #if defined(__x86_64__)
-  #include <crc32intrin.h>
+  // #include <crc32intrin.h>
   #include <nmmintrin.h>
   #include <immintrin.h>
   #ifdef __AVX512F__
@@ -145,7 +145,7 @@ class ThreadPool {
 public:
     ThreadPool(size_t num_threads, int pin_offset = 0) {
         for (size_t i = 0; i < num_threads; ++i) {
-            threads.emplace_back([=] { this->worker_thread(pin_offset + i); });
+            threads.emplace_back([=, this] { this->worker_thread(pin_offset + i); });
         }
     }
 
@@ -532,13 +532,15 @@ int main(int argc, char** argv) {
 
     // Use all cpus to init hash table data.
     TheMap* thread_results = (TheMap*)aligned_alloc(128, sizeof(TheMap)*num_cpus);
+    TaskManager init_tasks(pool);
     for (int i=0; i<num_cpus; ++i) {
-      pool.enqueue([=, &thread_results] (int) {
+      init_tasks.enqueue([=, &thread_results] (int) {
         for (auto& e : thread_results[i]) {
           e = MinMaxAvg();
         }
       });
     }
+    init_tasks.flush();
 
     auto t0r = t0.milliseconds();
 
